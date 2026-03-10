@@ -14,15 +14,16 @@
 # limitations under the License.
 
 import audio_metadata
-import datasets
 import math
 import os
 import random
 import wave
 
 import numpy as np
+import soundfile as sf
 
 from pathlib import Path
+from scipy.signal import resample_poly
 
 from microwakeword.audio.audio_utils import remove_silence_webrtc
 
@@ -42,6 +43,19 @@ class Clips:
         trimmed_clip_duration_s: (float | None, optional): The duration of the clips to trim the end of long clips. Set to None to disable trimming. Defaults to None.
         trim_zerios: (bool, optional): If true, any leading and trailling zeros are removed. Defaults to false.
     """
+
+    @staticmethod
+    def _load_audio_path(path: str) -> np.ndarray:
+        audio, sample_rate = sf.read(path, dtype="float32", always_2d=False)
+        if isinstance(audio, np.ndarray) and audio.ndim > 1:
+            audio = audio[:, 0]
+        audio = np.asarray(audio, dtype=np.float32)
+        if sample_rate != 16000:
+            gcd = math.gcd(int(sample_rate), 16000)
+            up = 16000 // gcd
+            down = int(sample_rate) // gcd
+            audio = resample_poly(audio, up, down).astype(np.float32, copy=False)
+        return audio
 
     def __init__(
         self,
@@ -132,31 +146,28 @@ class Clips:
                         ):
                             filtered_paths.append(audio_file)
 
-        # Load all filtered clips
-        audio_dataset = datasets.Dataset.from_dict(
-            {"audio": [str(i) for i in filtered_paths]}
-        ).cast_column("audio", datasets.Audio())
-
-        # Convert all clips to 16 kHz sampling rate when accessed
-        audio_dataset = audio_dataset.cast_column(
-            "audio", datasets.Audio(sampling_rate=16000)
-        )
-
         if random_split_seed is not None:
-            train_testvalid = audio_dataset.train_test_split(
-                test_size=2 * split_count, seed=random_split_seed
-            )
-            test_valid = train_testvalid["test"].train_test_split(test_size=0.5)
-            split_dataset = datasets.DatasetDict(
-                {
-                    "train": train_testvalid["train"],
-                    "test": test_valid["test"],
-                    "validation": test_valid["train"],
-                }
-            )
-            self.split_clips = split_dataset
+            shuffled = list(filtered_paths)
+            rnd = random.Random(random_split_seed)
+            rnd.shuffle(shuffled)
 
-        self.clips = audio_dataset
+            if isinstance(split_count, float):
+                split_n = max(1, int(round(len(shuffled) * split_count)))
+            else:
+                split_n = int(split_count)
+            split_n = min(split_n, max(1, len(shuffled) // 2)) if shuffled else 0
+
+            test_and_val = shuffled[: 2 * split_n]
+            train = shuffled[2 * split_n :]
+            validation = test_and_val[:split_n]
+            test = test_and_val[split_n:]
+            self.split_clips = {
+                "train": train,
+                "test": test,
+                "validation": validation,
+            }
+
+        self.clips = list(filtered_paths)
 
     def audio_generator(self, split: str | None = None, repeat: int = 1):
         """A Python generator that retrieves all loaded audio clips.
@@ -174,7 +185,7 @@ class Clips:
             clip_list = self.split_clips[split]
         for _ in range(repeat):
             for clip in clip_list:
-                clip_audio = clip["audio"]["array"]
+                clip_audio = self._load_audio_path(str(clip))
 
                 if self.remove_silence:
                     clip_audio = self.remove_silence_function(clip_audio)
@@ -196,7 +207,7 @@ class Clips:
             numpy.ndarray: Array with the audio clip's samples.
         """
         rand_audio_entry = random.choice(self.clips)
-        clip_audio = rand_audio_entry["audio"]["array"]
+        clip_audio = self._load_audio_path(str(rand_audio_entry))
 
         if self.remove_silence:
             clip_audio = self.remove_silence_function(clip_audio)
