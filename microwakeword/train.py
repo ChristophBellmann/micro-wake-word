@@ -38,24 +38,63 @@ def swap_attribute(obj, attr, temp_value):
         setattr(obj, attr, original_value)
 
 
+def nonstreaming_eval_batch_size() -> int:
+    value = os.environ.get("MICRO_NONSTREAMING_EVAL_BATCH_SIZE", "1024").strip()
+    try:
+        return max(1, int(value))
+    except ValueError:
+        logging.warning(
+            "Invalid MICRO_NONSTREAMING_EVAL_BATCH_SIZE=%r, falling back to 1024",
+            value,
+        )
+        return 1024
+
+
+def make_streaming_eval_dataset(
+    config,
+    data_processor,
+    data_set: str,
+    truncation_strategy: str,
+):
+    feature_shape = tuple(config["training_input_shape"])
+
+    def sample_generator():
+        for provider in data_processor.feature_providers:
+            generator = provider.get_feature_generator(
+                data_set,
+                features_length=config["spectrogram_length"],
+                truncation_strategy=truncation_strategy,
+            )
+            for spectrogram in generator:
+                yield (
+                    np.asarray(spectrogram, dtype=np.float32),
+                    np.asarray([provider.label], dtype=np.float32),
+                )
+
+    dataset = tf.data.Dataset.from_generator(
+        sample_generator,
+        output_signature=(
+            tf.TensorSpec(shape=feature_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=(1,), dtype=tf.float32),
+        ),
+    )
+    return dataset.batch(nonstreaming_eval_batch_size()).prefetch(tf.data.AUTOTUNE)
+
+
 def validate_nonstreaming(config, data_processor, model, test_set):
     def as_array(value):
         return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
 
-    testing_fingerprints, testing_ground_truth, _ = data_processor.get_data(
-        test_set,
-        batch_size=config["batch_size"],
-        features_length=config["spectrogram_length"],
-        truncation_strategy="truncate_start",
-    )
-    testing_ground_truth = testing_ground_truth.reshape(-1, 1)
-
     model.reset_metrics()
 
+    testing_dataset = make_streaming_eval_dataset(
+        config,
+        data_processor,
+        test_set,
+        truncation_strategy="truncate_start",
+    )
     result = model.evaluate(
-        testing_fingerprints,
-        testing_ground_truth,
-        batch_size=1024,
+        testing_dataset,
         return_dict=True,
         verbose=0,
     )
@@ -76,24 +115,16 @@ def validate_nonstreaming(config, data_processor, model, test_set):
     test_set_fp = as_array(result["fp"])
 
     if data_processor.get_mode_size("validation_ambient") > 0:
-        (
-            ambient_testing_fingerprints,
-            ambient_testing_ground_truth,
-            _,
-        ) = data_processor.get_data(
-            test_set + "_ambient",
-            batch_size=config["batch_size"],
-            features_length=config["spectrogram_length"],
-            truncation_strategy="split",
-        )
-        ambient_testing_ground_truth = ambient_testing_ground_truth.reshape(-1, 1)
-
         # XXX: tf no longer provides a way to evaluate a model without updating metrics
         with swap_attribute(model, "reset_metrics", lambda: None):
+            ambient_testing_dataset = make_streaming_eval_dataset(
+                config,
+                data_processor,
+                test_set + "_ambient",
+                truncation_strategy="split",
+            )
             ambient_predictions = model.evaluate(
-                ambient_testing_fingerprints,
-                ambient_testing_ground_truth,
-                batch_size=1024,
+                ambient_testing_dataset,
                 return_dict=True,
                 verbose=0,
             )
