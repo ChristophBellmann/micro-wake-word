@@ -167,6 +167,9 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
 
 def train(model, config, data_processor):
+    skip_nonstreaming_validation = (
+        os.environ.get("MICRO_BENCH_SKIP_VALIDATION", "0") == "1"
+    )
     # Assign default training settings if not set in the configuration yaml
     if not (training_steps_list := config.get("training_steps")):
         training_steps_list = [20000]
@@ -350,6 +353,12 @@ def train(model, config, data_processor):
             model.save_weights(
                 os.path.join(config["train_dir"], "last_weights.weights.h5")
             )
+
+            if skip_nonstreaming_validation:
+                logging.info(
+                    "Skipping nonstreaming validation (MICRO_BENCH_SKIP_VALIDATION=1)"
+                )
+                continue
 
             nonstreaming_metrics = validate_nonstreaming(
                 config, data_processor, model, "validation"
