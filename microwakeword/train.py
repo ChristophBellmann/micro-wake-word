@@ -316,6 +316,9 @@ def train(model, config, data_processor):
 
         is_last_step = training_step == training_steps_max
         if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
+            progress_pct = (training_step / training_steps_max) * 100.0
+            current_eval_batch = int(np.ceil(training_step / config["eval_step_interval"]))
+            total_eval_batches = int(np.ceil(training_steps_max / config["eval_step_interval"]))
             logging.info(
                 "Step #%d: rate %f, accuracy %.2f%%, recall %.2f%%, precision %.2f%%, cross entropy %f",
                 *(
@@ -326,6 +329,14 @@ def train(model, config, data_processor):
                     result[3] * 100,
                     result[9],
                 ),
+            )
+            logging.info(
+                "Progress: %.1f%% (%d/%d steps, eval batch %d/%d)",
+                progress_pct,
+                training_step,
+                training_steps_max,
+                current_eval_batch,
+                total_eval_batches,
             )
 
             with train_writer.as_default():
