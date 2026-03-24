@@ -900,6 +900,8 @@ def validate_nonstreaming_with_policy(config, data_processor, model, test_set, m
     metrics["ambient_false_positives"] = 0
     metrics["ambient_false_positives_per_hour"] = 0
     metrics["average_viable_recall"] = 0
+    metrics["ambient_metrics_available"] = False
+    metrics["ambient_reporting_cutoff"] = 0.5
 
     ambient_mode = test_set + "_ambient"
     if not include_ambient or data_processor.get_mode_size(ambient_mode) <= 0:
@@ -969,7 +971,40 @@ def validate_nonstreaming_with_policy(config, data_processor, model, test_set, m
     metrics["average_viable_recall"] = (
         np.trapz(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
     )
+    metrics["ambient_metrics_available"] = True
     return metrics
+
+
+def format_nonstreaming_validation_log(training_step, nonstreaming_metrics):
+    validation_mode = nonstreaming_metrics["validation_mode"]
+    prefix = (
+        f"Step {training_step} (nonstreaming/{validation_mode}): Validation: "
+        f"accuracy = {nonstreaming_metrics['accuracy'] * 100:.2f}%, "
+        f"recall = {nonstreaming_metrics['recall'] * 100:.2f}%, "
+        f"precision = {nonstreaming_metrics['precision'] * 100:.2f}%, "
+        f"loss = {nonstreaming_metrics['loss']:.5f}, "
+        f"auc = {nonstreaming_metrics['auc']:.5f}"
+    )
+    if not nonstreaming_metrics.get("ambient_metrics_available", False):
+        return (
+            prefix
+            + ", recall at no faph = n/a, cutoff = n/a, "
+            + "ambient false positives = n/a, estimated false positives per hour = n/a, "
+            + "average viable recall = n/a"
+        )
+
+    ambient_cutoff = nonstreaming_metrics.get("ambient_reporting_cutoff", 0.5)
+    return (
+        prefix
+        + f", recall at no faph = {nonstreaming_metrics['recall_at_no_faph'] * 100:.3f}"
+        + f" with cutoff {nonstreaming_metrics['cutoff_for_no_faph']:.2f}, "
+        + f"ambient false positives @ cutoff {ambient_cutoff:.2f} = "
+        + f"{int(nonstreaming_metrics['ambient_false_positives'])}, "
+        + "estimated false positives per hour "
+        + f"@ cutoff {ambient_cutoff:.2f} = "
+        + f"{nonstreaming_metrics['ambient_false_positives_per_hour']:.5f}, "
+        + f"average viable recall = {nonstreaming_metrics['average_viable_recall']:.9f}"
+    )
 
 
 def train(model, config, data_processor):
@@ -1353,21 +1388,9 @@ def train(model, config, data_processor):
             )
             model.reset_metrics()  # reset metrics for next validation epoch of training
             logging.info(
-                "Step %d (nonstreaming/%s): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
-                *(
-                    training_step,
-                    validation_mode,
-                    nonstreaming_metrics["recall_at_no_faph"] * 100,
-                    nonstreaming_metrics["cutoff_for_no_faph"],
-                    nonstreaming_metrics["accuracy"] * 100,
-                    nonstreaming_metrics["recall"] * 100,
-                    nonstreaming_metrics["precision"] * 100,
-                    nonstreaming_metrics["ambient_false_positives"],
-                    nonstreaming_metrics["ambient_false_positives_per_hour"],
-                    nonstreaming_metrics["loss"],
-                    nonstreaming_metrics["auc"],
-                    nonstreaming_metrics["average_viable_recall"],
-                ),
+                format_nonstreaming_validation_log(
+                    training_step, nonstreaming_metrics
+                )
             )
 
             with validation_writer.as_default():
