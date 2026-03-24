@@ -31,10 +31,16 @@ class Model:
         stride (int | None, optional): Time dimension's stride. If None, then the stride is the input tensor's time dimension. Defaults to None.
     """
 
-    def __init__(self, tflite_model_path: str, stride: int | None = None):
+    def __init__(
+        self,
+        tflite_model_path: str,
+        stride: int | None = None,
+        num_threads: int | None = None,
+    ):
         # Load tflite model
         interpreter = Interpreter(
             model_path=tflite_model_path,
+            num_threads=num_threads,
         )
         interpreter.allocate_tensors()
 
