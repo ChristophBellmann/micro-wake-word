@@ -226,7 +226,7 @@ def tf_model_accuracy(
         metric dictionary with keys for `accuracy`, `recall`, `precision`, `false_positive_rate`, `false_negative_rate`, and `count`
     """
 
-    test_fingerprints, test_ground_truth, _ = audio_processor.get_data(
+    test_fingerprints, test_ground_truth, _, _ = audio_processor.get_data(
         data_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
@@ -323,7 +323,7 @@ def tflite_streaming_model_roc(
         os.path.join(config["train_dir"], folder, tflite_model_name), stride=stride
     )
 
-    test_ambient_fingerprints, _, _ = audio_processor.get_data(
+    test_ambient_fingerprints, _, _, _ = audio_processor.get_data(
         ambient_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
@@ -351,7 +351,7 @@ def tflite_streaming_model_roc(
         step_s=config["window_step_ms"] / 1000,
     )
 
-    test_fingerprints, test_ground_truth, _ = audio_processor.get_data(
+    test_fingerprints, test_ground_truth, _, _ = audio_processor.get_data(
         data_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],
@@ -437,7 +437,7 @@ def tflite_model_accuracy(
     if data_set.endswith("ambient"):
         truncation_strategy = "none"
 
-    test_fingerprints, test_ground_truth, _ = audio_processor.get_data(
+    test_fingerprints, test_ground_truth, _, _ = audio_processor.get_data(
         data_set,
         batch_size=config["batch_size"],
         features_length=config["spectrogram_length"],

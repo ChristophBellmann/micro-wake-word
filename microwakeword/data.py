@@ -15,6 +15,7 @@
 
 """Functions and classes for loading/augmenting spectrograms"""
 
+import json
 import os
 import random
 
@@ -321,6 +322,129 @@ class MmapFeatureGenerator(object):
                     yield fixed_spectrogram
 
 
+class DistillationMmapFeatureGenerator(object):
+    """A feature provider that attaches a teacher score to each spectrogram."""
+
+    def __init__(
+        self,
+        metadata_jsonl: str,
+        sampling_weight: float,
+        penalty_weight: float,
+        truncation_strategy: str,
+        stride: int,
+        step: float,
+        hard_label_threshold: float = 0.5,
+        fixed_right_cutoffs: list[int] = [0],
+    ):
+        self.sampling_weight = sampling_weight
+        self.penalty_weight = penalty_weight
+        self.truncation_strategy = truncation_strategy
+        self.fixed_right_cutoffs = fixed_right_cutoffs
+        self.hard_label_threshold = hard_label_threshold
+        self.stride = stride
+        self.step = step
+
+        self.stats = {}
+        self.feature_sets = {}
+        self.feature_sets["training"] = []
+        self.feature_sets["validation"] = []
+        self.feature_sets["testing"] = []
+        self.feature_sets["validation_ambient"] = []
+        self.feature_sets["testing_ambient"] = []
+        self.loaded_features = []
+
+        metadata_path = Path(os.path.abspath(metadata_jsonl))
+        if not metadata_path.exists():
+            raise FileNotFoundError(
+                f"Distillation metadata jsonl not found: {metadata_path}"
+            )
+
+        with metadata_path.open("r", encoding="utf-8") as infile:
+            rows = [json.loads(line) for line in infile if line.strip()]
+
+        duration = 0.0
+        count = 0
+        for row in rows:
+            mmap_path = Path(row["mmap_dir"]).resolve()
+            teacher_score = float(row["teacher_score"])
+            if not mmap_path.exists():
+                continue
+            imported_features = RaggedMmap(str(mmap_path))
+            self.loaded_features.append(imported_features)
+            feature_index = len(self.loaded_features) - 1
+            for i in range(0, len(imported_features)):
+                self.feature_sets["training"].append(
+                    {
+                        "loaded_feature_index": feature_index,
+                        "subindex": i,
+                        "teacher_score": teacher_score,
+                    }
+                )
+                duration += step * imported_features[i].shape[0]
+                count += 1
+
+        random.shuffle(self.feature_sets["training"])
+        self.stats["training"] = {"spectrogram_count": count, "total_duration": duration}
+        self.stats["validation"] = {"spectrogram_count": 0, "total_duration": 0.0}
+        self.stats["testing"] = {"spectrogram_count": 0, "total_duration": 0.0}
+        self.stats["validation_ambient"] = {"spectrogram_count": 0, "total_duration": 0.0}
+        self.stats["testing_ambient"] = {"spectrogram_count": 0, "total_duration": 0.0}
+
+    def get_mode_duration(self, mode: str):
+        return self.stats[mode]["total_duration"]
+
+    def get_mode_size(self, mode):
+        return self.stats[mode]["spectrogram_count"]
+
+    def _get_entry_spectrogram(
+        self, entry, features_length: int, truncation_strategy: str
+    ) -> np.ndarray:
+        right_cutoff = 0
+        if truncation_strategy == "default":
+            truncation_strategy = self.truncation_strategy
+
+        if truncation_strategy == "fixed_right_cutoff":
+            right_cutoff = random.choice(self.fixed_right_cutoffs)
+
+        spectrogram = self.loaded_features[entry["loaded_feature_index"]][entry["subindex"]]
+        spectrogram = fixed_length_spectrogram(
+            spectrogram,
+            features_length,
+            truncation_strategy,
+            right_cutoff,
+        )
+        if np.issubdtype(spectrogram.dtype, np.uint16):
+            spectrogram = spectrogram.astype(np.float32) * 0.0390625
+        return spectrogram
+
+    def get_random_example(self, mode, features_length, truncation_strategy):
+        if mode != "training":
+            raise ValueError("Distillation provider supports training mode only.")
+        entry = random.choice(self.feature_sets["training"])
+        spectrogram = self._get_entry_spectrogram(
+            entry, features_length, truncation_strategy
+        )
+        soft_label = float(entry["teacher_score"])
+        hard_label = 1.0 if soft_label >= self.hard_label_threshold else 0.0
+        return spectrogram, hard_label, float(self.penalty_weight), soft_label
+
+    def get_random_spectrogram(self, mode, features_length, truncation_strategy):
+        spectrogram, _, _, _ = self.get_random_example(
+            mode, features_length, truncation_strategy
+        )
+        return spectrogram
+
+    def get_feature_generator(self, mode, features_length, truncation_strategy="default"):
+        if mode != "training":
+            for x in []:
+                yield x
+            return
+        if truncation_strategy == "default":
+            truncation_strategy = self.truncation_strategy
+        for entry in self.feature_sets["training"]:
+            yield self._get_entry_spectrogram(entry, features_length, truncation_strategy)
+
+
 class ClipsHandlerWrapperGenerator(object):
     """A class that handles loading spectrograms from audio files on the disk to use while training. This generates spectrograms with random augmentations applied during the training process.
 
@@ -450,6 +574,23 @@ class FeatureHandler(object):
                         feature_set["truncation_strategy"],
                     )
                 )
+            elif feature_set["type"] == "distillation_mmap":
+                self.feature_providers.append(
+                    DistillationMmapFeatureGenerator(
+                        feature_set["metadata_jsonl"],
+                        feature_set["sampling_weight"],
+                        feature_set["penalty_weight"],
+                        feature_set["truncation_strategy"],
+                        stride=config["stride"],
+                        step=config["window_step_ms"] / 1000.0,
+                        hard_label_threshold=feature_set.get(
+                            "hard_label_threshold", 0.5
+                        ),
+                        fixed_right_cutoffs=feature_set.get(
+                            "fixed_right_cutoffs", [0]
+                        ),
+                    )
+                )
             set_modes = [
                 "training",
                 "validation",
@@ -536,6 +677,7 @@ class FeatureHandler(object):
         data = []
         labels = []
         weights = []
+        soft_labels = []
 
         if mode == "training":
             random_feature_providers = random.choices(
@@ -553,9 +695,22 @@ class FeatureHandler(object):
             )
 
             for provider in random_feature_providers:
-                spectrogram = provider.get_random_spectrogram(
-                    "training", features_length, truncation_strategy
-                )
+                soft_label = np.nan
+                if hasattr(provider, "get_random_example"):
+                    (
+                        spectrogram,
+                        sampled_label,
+                        sampled_weight,
+                        soft_label,
+                    ) = provider.get_random_example(
+                        "training", features_length, truncation_strategy
+                    )
+                else:
+                    spectrogram = provider.get_random_spectrogram(
+                        "training", features_length, truncation_strategy
+                    )
+                    sampled_label = float(provider.label)
+                    sampled_weight = float(provider.penalty_weight)
                 spectrogram = spec_augment(
                     spectrogram,
                     augmentation_policy["time_mask_max_size"],
@@ -565,8 +720,9 @@ class FeatureHandler(object):
                 )
 
                 data.append(spectrogram)
-                labels.append(float(provider.label))
-                weights.append(float(provider.penalty_weight))
+                labels.append(float(sampled_label))
+                weights.append(float(sampled_weight))
+                soft_labels.append(float(soft_label) if not np.isnan(soft_label) else np.nan)
         else:
             for provider in self.feature_providers:
                 generator = provider.get_feature_generator(
@@ -577,16 +733,18 @@ class FeatureHandler(object):
                     data.append(spectrogram)
                     labels.append(provider.label)
                     weights.append(provider.penalty_weight)
+                    soft_labels.append(np.nan)
 
         if truncation_strategy != "none":
             # Spectrograms are all the same length, convert to numpy array
             data = np.array(data)
         labels = np.array(labels)
         weights = np.array(weights)
+        soft_labels = np.array(soft_labels)
 
         if truncation_strategy == "none":
             # Spectrograms may be of different length
-            return data, np.array(labels), np.array(weights)
+            return data, np.array(labels), np.array(weights), np.array(soft_labels)
 
         indices = np.arange(labels.shape[0])
 
@@ -594,4 +752,4 @@ class FeatureHandler(object):
             # Randomize the order of the data, weights, and labels
             np.random.shuffle(indices)
 
-        return data[indices], labels[indices], weights[indices]
+        return data[indices], labels[indices], weights[indices], soft_labels[indices]

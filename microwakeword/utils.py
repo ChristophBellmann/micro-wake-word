@@ -301,7 +301,7 @@ def convert_saved_model_to_tflite(
     """
 
     def representative_dataset_gen():
-        sample_fingerprints, _, _ = audio_processor.get_data(
+        sample_fingerprints, _, _, _ = audio_processor.get_data(
             "training", 500, features_length=config["spectrogram_length"]
         )
 
