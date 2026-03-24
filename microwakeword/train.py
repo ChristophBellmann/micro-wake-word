@@ -491,11 +491,14 @@ def train(model, config, data_processor):
         train_ground_truth = train_ground_truth.reshape(-1, 1)
         train_soft_labels = train_soft_labels.reshape(-1, 1)
 
-        class_weights = {0: negative_class_weight, 1: positive_class_weight}
-        combined_weights = train_sample_weights * np.vectorize(class_weights.get)(
-            train_ground_truth
+        ground_truth_flat = train_ground_truth.reshape(-1)
+        sample_weights_flat = train_sample_weights.reshape(-1)
+        class_weight_vector = np.where(
+            ground_truth_flat >= 0.5, positive_class_weight, negative_class_weight
+        ).astype(np.float32)
+        combined_weights_flat = (sample_weights_flat * class_weight_vector).astype(
+            np.float32
         )
-        combined_weights = combined_weights.reshape(-1, 1).astype(np.float32)
 
         distillation_mask = np.isfinite(train_soft_labels).astype(np.float32)
         distillation_active = distillation_enabled and bool(
@@ -506,7 +509,7 @@ def train(model, config, data_processor):
             result = model.train_on_batch(
                 train_fingerprints,
                 train_ground_truth,
-                sample_weight=combined_weights,
+                sample_weight=combined_weights_flat,
             )
             train_accuracy = float(result[1])
             train_recall = float(result[2])
@@ -518,7 +521,9 @@ def train(model, config, data_processor):
         else:
             x_batch = tf.convert_to_tensor(train_fingerprints, dtype=tf.float32)
             y_batch = tf.convert_to_tensor(train_ground_truth, dtype=tf.float32)
-            w_batch = tf.convert_to_tensor(combined_weights, dtype=tf.float32)
+            w_batch = tf.reshape(
+                tf.convert_to_tensor(combined_weights_flat, dtype=tf.float32), (-1, 1)
+            )
             soft_batch = tf.convert_to_tensor(train_soft_labels, dtype=tf.float32)
             finite_soft_mask = tf.cast(tf.math.is_finite(soft_batch), tf.float32)
 
@@ -535,7 +540,12 @@ def train(model, config, data_processor):
                 )
 
                 clipped_pred = tf.clip_by_value(y_pred, 1e-6, 1.0 - 1e-6)
-                clipped_teacher = tf.clip_by_value(soft_batch, 1e-6, 1.0 - 1e-6)
+                safe_teacher = tf.where(
+                    tf.math.is_finite(soft_batch),
+                    soft_batch,
+                    tf.fill(tf.shape(soft_batch), 0.5),
+                )
+                clipped_teacher = tf.clip_by_value(safe_teacher, 1e-6, 1.0 - 1e-6)
                 student_logits = tf.math.log(clipped_pred / (1.0 - clipped_pred))
                 teacher_logits = tf.math.log(clipped_teacher / (1.0 - clipped_teacher))
                 student_temp = tf.sigmoid(student_logits / distillation_temperature)
@@ -556,19 +566,23 @@ def train(model, config, data_processor):
 
             gradients = tape.gradient(total_loss, model.trainable_variables)
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            model.compiled_metrics.update_state(
-                y_batch,
-                y_pred,
-                sample_weight=tf.reshape(w_batch, (-1,)),
-            )
+            y_pred_np = y_pred.numpy().reshape(-1)
+            y_true_np = y_batch.numpy().reshape(-1)
+            y_true_bin = y_true_np >= 0.5
+            y_pred_bin = y_pred_np >= 0.5
 
-            metric_values = {
-                metric.name: float(metric.result().numpy()) for metric in model.metrics
-            }
-            train_accuracy = float(metric_values.get("accuracy", 0.0))
-            train_recall = float(metric_values.get("recall", 0.0))
-            train_precision = float(metric_values.get("precision", 0.0))
-            train_auc = float(metric_values.get("auc", 0.0))
+            tp = float(np.sum(np.logical_and(y_true_bin, y_pred_bin)))
+            tn = float(np.sum(np.logical_and(~y_true_bin, ~y_pred_bin)))
+            fp = float(np.sum(np.logical_and(~y_true_bin, y_pred_bin)))
+            fn = float(np.sum(np.logical_and(y_true_bin, ~y_pred_bin)))
+            total = max(1.0, tp + tn + fp + fn)
+
+            train_accuracy = (tp + tn) / total
+            train_recall = tp / max(1.0, tp + fn)
+            train_precision = tp / max(1.0, tp + fp)
+            auc_metric = tf.keras.metrics.AUC()
+            auc_metric.update_state(y_true_np, y_pred_np)
+            train_auc = float(auc_metric.result().numpy())
             train_hard_loss = float(hard_loss.numpy())
             train_distill_loss = float(distillation_loss.numpy())
             train_total_loss = float(total_loss.numpy())
