@@ -352,6 +352,7 @@ class DistillationMmapFeatureGenerator(object):
         self.feature_sets["validation_ambient"] = []
         self.feature_sets["testing_ambient"] = []
         self.loaded_features = []
+        loaded_feature_indices = {}
 
         metadata_path = Path(os.path.abspath(metadata_jsonl))
         if not metadata_path.exists():
@@ -365,14 +366,29 @@ class DistillationMmapFeatureGenerator(object):
         duration = 0.0
         count = 0
         for row in rows:
-            mmap_path = Path(row["mmap_dir"]).resolve()
+            mmap_path_value = row.get("features_dir") or row.get("mmap_dir")
+            if not mmap_path_value:
+                continue
+            mmap_path = Path(mmap_path_value).resolve()
             teacher_score = float(row["teacher_score"])
             if not mmap_path.exists():
                 continue
-            imported_features = RaggedMmap(str(mmap_path))
-            self.loaded_features.append(imported_features)
-            feature_index = len(self.loaded_features) - 1
-            for i in range(0, len(imported_features)):
+            mmap_key = str(mmap_path)
+            if mmap_key not in loaded_feature_indices:
+                imported_features = RaggedMmap(str(mmap_path))
+                self.loaded_features.append(imported_features)
+                loaded_feature_indices[mmap_key] = len(self.loaded_features) - 1
+            feature_index = loaded_feature_indices[mmap_key]
+            imported_features = self.loaded_features[feature_index]
+
+            if "subindex" in row:
+                subindices = [int(row["subindex"])]
+            else:
+                subindices = range(0, len(imported_features))
+
+            for i in subindices:
+                if i < 0 or i >= len(imported_features):
+                    continue
                 self.feature_sets["training"].append(
                     {
                         "loaded_feature_index": feature_index,

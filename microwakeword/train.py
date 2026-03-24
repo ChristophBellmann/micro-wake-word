@@ -26,7 +26,6 @@ from absl import logging
 import numpy as np
 import tensorflow as tf
 
-from tensorflow.python.util import tf_decorator
 import microwakeword.data as data_lib
 
 
@@ -63,6 +62,13 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
     except ValueError:
         logging.warning("Invalid %s=%r, falling back to %d", name, value, default)
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
 
 
 def apply_optional_device_prefetch(dataset: tf.data.Dataset) -> tf.data.Dataset:
@@ -874,10 +880,130 @@ def train(model, config, data_processor):
     ]
 
     model.compile(optimizer=optimizer, loss=loss, metrics=metrics)
+    graph_mode = env_bool("MICRO_TRAIN_GRAPH_MODE", True)
+    jit_compile = graph_mode and env_bool("MICRO_TRAIN_JIT_COMPILE", False)
+    progress_interval = env_int("MICRO_TRAIN_PROGRESS_INTERVAL", 25, minimum=1)
+    logging.info(
+        "Training execution mode: %s (jit_compile=%s, progress_interval=%d)",
+        "graph" if graph_mode else "eager",
+        jit_compile,
+        progress_interval,
+    )
 
-    # We un-decorate the `tf.function`, it's very slow to manually run training batches
-    model.make_train_function()
-    _, model.train_function = tf_decorator.unwrap(model.train_function)
+    def _train_step_impl(
+        x_batch,
+        y_batch,
+        base_weights_batch,
+        soft_batch,
+        positive_class_weight,
+        negative_class_weight,
+        time_mask_max_size,
+        time_mask_count,
+        freq_mask_max_size,
+        freq_mask_count,
+    ):
+        x_batch = tf_spec_augment_batch(
+            x_batch,
+            time_mask_max_size,
+            time_mask_count,
+            freq_mask_max_size,
+            freq_mask_count,
+        )
+
+        class_weight_vector = tf.where(
+            y_batch >= 0.5,
+            tf.cast(positive_class_weight, tf.float32),
+            tf.cast(negative_class_weight, tf.float32),
+        )
+        w_batch = base_weights_batch * class_weight_vector
+
+        finite_soft_mask = tf.cast(tf.math.is_finite(soft_batch), tf.float32)
+        has_distillation_targets = tf.reduce_any(finite_soft_mask > 0.0)
+
+        with tf.GradientTape() as tape:
+            y_pred = model(x_batch, training=True)
+
+            hard_loss_per_sample = tf.keras.backend.binary_crossentropy(y_batch, y_pred)
+            hard_loss_per_sample = tf.reshape(hard_loss_per_sample, (-1, 1))
+            hard_weight_sum = tf.reduce_sum(w_batch) + 1e-8
+            hard_loss = tf.reduce_sum(hard_loss_per_sample * w_batch) / hard_weight_sum
+
+            clipped_pred = tf.clip_by_value(y_pred, 1e-6, 1.0 - 1e-6)
+            safe_teacher = tf.where(
+                tf.math.is_finite(soft_batch),
+                soft_batch,
+                tf.fill(tf.shape(soft_batch), 0.5),
+            )
+            clipped_teacher = tf.clip_by_value(safe_teacher, 1e-6, 1.0 - 1e-6)
+            student_logits = tf.math.log(clipped_pred / (1.0 - clipped_pred))
+            teacher_logits = tf.math.log(clipped_teacher / (1.0 - clipped_teacher))
+            student_temp = tf.sigmoid(student_logits / distillation_temperature)
+            teacher_temp = tf.sigmoid(teacher_logits / distillation_temperature)
+
+            distillation_loss_per_sample = tf.square(student_temp - teacher_temp)
+            distillation_weights = w_batch * finite_soft_mask
+            distillation_weight_sum = tf.reduce_sum(distillation_weights)
+            distillation_loss = tf.where(
+                distillation_weight_sum > 0.0,
+                tf.reduce_sum(distillation_loss_per_sample * distillation_weights)
+                / (distillation_weight_sum + 1e-8),
+                tf.zeros((), dtype=tf.float32),
+            )
+
+            effective_alpha = tf.constant(0.0, dtype=tf.float32)
+            effective_beta = tf.constant(1.0, dtype=tf.float32)
+            if distillation_enabled:
+                effective_alpha = tf.where(
+                    has_distillation_targets,
+                    tf.cast(distillation_alpha, tf.float32),
+                    tf.constant(0.0, dtype=tf.float32),
+                )
+                effective_beta = tf.where(
+                    has_distillation_targets,
+                    tf.cast(distillation_beta, tf.float32),
+                    tf.constant(1.0, dtype=tf.float32),
+                )
+
+            total_loss = effective_beta * hard_loss + effective_alpha * distillation_loss
+
+        gradients = tape.gradient(total_loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+
+        y_true_bin = y_batch >= 0.5
+        y_pred_bin = y_pred >= 0.5
+        tp = tf.reduce_sum(
+            tf.cast(tf.logical_and(y_true_bin, y_pred_bin), tf.float32)
+        )
+        tn = tf.reduce_sum(
+            tf.cast(tf.logical_and(tf.logical_not(y_true_bin), tf.logical_not(y_pred_bin)), tf.float32)
+        )
+        fp = tf.reduce_sum(
+            tf.cast(tf.logical_and(tf.logical_not(y_true_bin), y_pred_bin), tf.float32)
+        )
+        fn = tf.reduce_sum(
+            tf.cast(tf.logical_and(y_true_bin, tf.logical_not(y_pred_bin)), tf.float32)
+        )
+        total = tf.maximum(1.0, tp + tn + fp + fn)
+
+        return {
+            "accuracy": (tp + tn) / total,
+            "recall": tf.math.divide_no_nan(tp, tp + fn),
+            "precision": tf.math.divide_no_nan(tp, tp + fp),
+            "hard_loss": hard_loss,
+            "distill_loss": distillation_loss,
+            "total_loss": total_loss,
+            "distillation_active": has_distillation_targets,
+            "auc": tf.constant(float("nan"), dtype=tf.float32),
+        }
+
+    if graph_mode:
+        train_step_runner = tf.function(
+            _train_step_impl,
+            reduce_retracing=True,
+            jit_compile=jit_compile,
+        )
+    else:
+        train_step_runner = _train_step_impl
 
     # Configure checkpointer and restore if available
     checkpoint_directory = os.path.join(config["train_dir"], "restore/")
@@ -963,119 +1089,44 @@ def train(model, config, data_processor):
             tf.convert_to_tensor(train_soft_labels, dtype=tf.float32), (-1, 1)
         )
 
-        # Apply SpecAugment in TF ops for both input modes.
-        x_batch = tf_spec_augment_batch(
+        train_result = train_step_runner(
             x_batch,
+            y_batch,
+            base_weights_batch,
+            soft_batch,
+            float(positive_class_weight),
+            float(negative_class_weight),
             int(time_mask_max_size),
             int(time_mask_count),
             int(freq_mask_max_size),
             int(freq_mask_count),
         )
 
-        class_weight_vector = tf.where(
-            y_batch >= 0.5,
-            tf.cast(float(positive_class_weight), tf.float32),
-            tf.cast(float(negative_class_weight), tf.float32),
-        )
-        combined_weights = base_weights_batch * class_weight_vector
-        combined_weights_flat = tf.reshape(combined_weights, (-1,))
-
-        finite_soft_mask = tf.cast(tf.math.is_finite(soft_batch), tf.float32)
-        distillation_active = distillation_enabled and bool(
-            tf.reduce_any(finite_soft_mask > 0.0).numpy()
-        )
-
-        if not distillation_active:
-            result = model.train_on_batch(
-                x_batch,
-                y_batch,
-                sample_weight=combined_weights_flat,
-            )
-            train_accuracy = float(result[1])
-            train_recall = float(result[2])
-            train_precision = float(result[3])
-            train_auc = float(result[8])
-            train_hard_loss = float(result[9])
-            train_distill_loss = 0.0
-            train_total_loss = train_hard_loss
-        else:
-            w_batch = tf.reshape(combined_weights_flat, (-1, 1))
-
-            with tf.GradientTape() as tape:
-                y_pred = model(x_batch, training=True)
-
-                hard_loss_per_sample = tf.keras.backend.binary_crossentropy(
-                    y_batch, y_pred
-                )
-                hard_loss_per_sample = tf.reshape(hard_loss_per_sample, (-1, 1))
-                hard_weight_sum = tf.reduce_sum(w_batch) + 1e-8
-                hard_loss = (
-                    tf.reduce_sum(hard_loss_per_sample * w_batch) / hard_weight_sum
-                )
-
-                clipped_pred = tf.clip_by_value(y_pred, 1e-6, 1.0 - 1e-6)
-                safe_teacher = tf.where(
-                    tf.math.is_finite(soft_batch),
-                    soft_batch,
-                    tf.fill(tf.shape(soft_batch), 0.5),
-                )
-                clipped_teacher = tf.clip_by_value(safe_teacher, 1e-6, 1.0 - 1e-6)
-                student_logits = tf.math.log(clipped_pred / (1.0 - clipped_pred))
-                teacher_logits = tf.math.log(clipped_teacher / (1.0 - clipped_teacher))
-                student_temp = tf.sigmoid(student_logits / distillation_temperature)
-                teacher_temp = tf.sigmoid(teacher_logits / distillation_temperature)
-
-                distillation_loss_per_sample = tf.square(student_temp - teacher_temp)
-                distillation_weights = w_batch * finite_soft_mask
-                distillation_weight_sum = tf.reduce_sum(distillation_weights) + 1e-8
-                distillation_loss = (
-                    tf.reduce_sum(distillation_loss_per_sample * distillation_weights)
-                    / distillation_weight_sum
-                )
-
-                total_loss = (
-                    distillation_beta * hard_loss
-                    + distillation_alpha * distillation_loss
-                )
-
-            gradients = tape.gradient(total_loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            y_pred_np = y_pred.numpy().reshape(-1)
-            y_true_np = y_batch.numpy().reshape(-1)
-            y_true_bin = y_true_np >= 0.5
-            y_pred_bin = y_pred_np >= 0.5
-
-            tp = float(np.sum(np.logical_and(y_true_bin, y_pred_bin)))
-            tn = float(np.sum(np.logical_and(~y_true_bin, ~y_pred_bin)))
-            fp = float(np.sum(np.logical_and(~y_true_bin, y_pred_bin)))
-            fn = float(np.sum(np.logical_and(y_true_bin, ~y_pred_bin)))
-            total = max(1.0, tp + tn + fp + fn)
-
-            train_accuracy = (tp + tn) / total
-            train_recall = tp / max(1.0, tp + fn)
-            train_precision = tp / max(1.0, tp + fp)
-            auc_metric = tf.keras.metrics.AUC()
-            auc_metric.update_state(y_true_np, y_pred_np)
-            train_auc = float(auc_metric.result().numpy())
-            train_hard_loss = float(hard_loss.numpy())
-            train_distill_loss = float(distillation_loss.numpy())
-            train_total_loss = float(total_loss.numpy())
-
-        # Print the running statistics in the current validation epoch
-        print(
-            "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
-                (training_step // config["eval_step_interval"] + 1),
-                train_accuracy,
-                train_recall,
-                train_precision,
-                train_total_loss,
-                (training_step % config["eval_step_interval"]),
-            ),
-            end="\r",
-        )
-
         is_last_step = training_step == training_steps_max
-        if (training_step % config["eval_step_interval"]) == 0 or is_last_step:
+        progress_due = (training_step % progress_interval) == 0 or is_last_step
+        eval_due = (training_step % config["eval_step_interval"]) == 0 or is_last_step
+        if progress_due or eval_due:
+            train_accuracy = float(train_result["accuracy"])
+            train_recall = float(train_result["recall"])
+            train_precision = float(train_result["precision"])
+            train_auc = float(train_result["auc"])
+            train_hard_loss = float(train_result["hard_loss"])
+            train_distill_loss = float(train_result["distill_loss"])
+            train_total_loss = float(train_result["total_loss"])
+            distillation_active = bool(train_result["distillation_active"])
+            print(
+                "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
+                    (training_step // config["eval_step_interval"] + 1),
+                    train_accuracy,
+                    train_recall,
+                    train_precision,
+                    train_total_loss,
+                    (training_step % config["eval_step_interval"]),
+                ),
+                end="\r",
+            )
+
+        if eval_due:
             progress_pct = (training_step / training_steps_max) * 100.0
             current_eval_batch = int(np.ceil(training_step / config["eval_step_interval"]))
             total_eval_batches = int(np.ceil(training_steps_max / config["eval_step_interval"]))
@@ -1118,7 +1169,8 @@ def train(model, config, data_processor):
                 tf.summary.scalar("accuracy", train_accuracy, step=training_step)
                 tf.summary.scalar("recall", train_recall, step=training_step)
                 tf.summary.scalar("precision", train_precision, step=training_step)
-                tf.summary.scalar("auc", train_auc, step=training_step)
+                if np.isfinite(train_auc):
+                    tf.summary.scalar("auc", train_auc, step=training_step)
                 train_writer.flush()
 
             model.save_weights(
