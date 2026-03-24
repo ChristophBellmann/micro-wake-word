@@ -17,6 +17,7 @@
 import os
 import platform
 import contextlib
+import random
 
 from absl import logging
 
@@ -50,26 +51,72 @@ def nonstreaming_eval_batch_size() -> int:
         return 1024
 
 
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(minimum, int(value))
+    except ValueError:
+        logging.warning("Invalid %s=%r, falling back to %d", name, value, default)
+        return default
+
+
 def make_streaming_eval_dataset(
     config,
     data_processor,
     data_set: str,
     truncation_strategy: str,
+    max_samples: int = 0,
 ):
     feature_shape = tuple(config["training_input_shape"])
 
     def sample_generator():
-        for provider in data_processor.feature_providers:
-            generator = provider.get_feature_generator(
-                data_set,
-                features_length=config["spectrogram_length"],
-                truncation_strategy=truncation_strategy,
-            )
-            for spectrogram in generator:
-                yield (
-                    np.asarray(spectrogram, dtype=np.float32),
-                    np.asarray([provider.label], dtype=np.float32),
+        if max_samples > 0:
+            providers = list(data_processor.feature_providers)
+            random.shuffle(providers)
+            iterators = [
+                (
+                    provider,
+                    iter(
+                        provider.get_feature_generator(
+                            data_set,
+                            features_length=config["spectrogram_length"],
+                            truncation_strategy=truncation_strategy,
+                        )
+                    ),
                 )
+                for provider in providers
+            ]
+            emitted = 0
+            while iterators and emitted < max_samples:
+                next_iterators = []
+                for provider, generator in iterators:
+                    try:
+                        spectrogram = next(generator)
+                    except StopIteration:
+                        continue
+                    yield (
+                        np.asarray(spectrogram, dtype=np.float32),
+                        np.asarray([provider.label], dtype=np.float32),
+                    )
+                    emitted += 1
+                    if emitted >= max_samples:
+                        break
+                    next_iterators.append((provider, generator))
+                iterators = next_iterators
+        else:
+            for provider in data_processor.feature_providers:
+                generator = provider.get_feature_generator(
+                    data_set,
+                    features_length=config["spectrogram_length"],
+                    truncation_strategy=truncation_strategy,
+                )
+                for spectrogram in generator:
+                    yield (
+                        np.asarray(spectrogram, dtype=np.float32),
+                        np.asarray([provider.label], dtype=np.float32),
+                    )
 
     dataset = tf.data.Dataset.from_generator(
         sample_generator,
@@ -92,6 +139,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
         data_processor,
         test_set,
         truncation_strategy="truncate_start",
+        max_samples=0,
     )
     result = model.evaluate(
         testing_dataset,
@@ -122,6 +170,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
                 data_processor,
                 test_set + "_ambient",
                 truncation_strategy="split",
+                max_samples=0,
             )
             ambient_predictions = model.evaluate(
                 ambient_testing_dataset,
@@ -197,10 +246,119 @@ def validate_nonstreaming(config, data_processor, model, test_set):
     return metrics
 
 
+def validate_nonstreaming_with_policy(config, data_processor, model, test_set, mode):
+    max_samples = 0
+    include_ambient = True
+    if mode == "fast":
+        max_samples = env_int("MICRO_FAST_VALIDATION_MAX_SAMPLES", 512, minimum=1)
+        include_ambient = False
+
+    metrics = {
+        "validation_mode": mode,
+        "is_full_validation": mode == "full",
+    }
+
+    def as_array(value):
+        return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
+
+    model.reset_metrics()
+    testing_dataset = make_streaming_eval_dataset(
+        config,
+        data_processor,
+        test_set,
+        truncation_strategy="truncate_start",
+        max_samples=max_samples,
+    )
+    result = model.evaluate(
+        testing_dataset,
+        return_dict=True,
+        verbose=0,
+    )
+
+    metrics["accuracy"] = result["accuracy"]
+    metrics["recall"] = result["recall"]
+    metrics["precision"] = result["precision"]
+    metrics["auc"] = result["auc"]
+    metrics["loss"] = result["loss"]
+    metrics["recall_at_no_faph"] = 0
+    metrics["cutoff_for_no_faph"] = 0
+    metrics["ambient_false_positives"] = 0
+    metrics["ambient_false_positives_per_hour"] = 0
+    metrics["average_viable_recall"] = 0
+
+    if not include_ambient or data_processor.get_mode_size("validation_ambient") <= 0:
+        return metrics
+
+    test_set_fp = as_array(result["fp"])
+    with swap_attribute(model, "reset_metrics", lambda: None):
+        ambient_testing_dataset = make_streaming_eval_dataset(
+            config,
+            data_processor,
+            test_set + "_ambient",
+            truncation_strategy="split",
+            max_samples=0,
+        )
+        ambient_predictions = model.evaluate(
+            ambient_testing_dataset,
+            return_dict=True,
+            verbose=0,
+        )
+
+    duration_of_ambient_set = data_processor.get_mode_duration("validation_ambient") / 3600.0
+    all_true_positives = as_array(ambient_predictions["tp"])
+    ambient_false_positives = as_array(ambient_predictions["fp"]) - test_set_fp
+    all_false_negatives = as_array(ambient_predictions["fn"])
+
+    metrics["auc"] = ambient_predictions["auc"]
+    metrics["loss"] = ambient_predictions["loss"]
+
+    recall_at_cutoffs = all_true_positives / (all_true_positives + all_false_negatives)
+    faph_at_cutoffs = ambient_false_positives / duration_of_ambient_set
+
+    target_faph_cutoff_probability = 1.0
+    recall_at_no_faph = 0.0
+    for index, cutoff in enumerate(np.linspace(0.0, 1.0, 101)):
+        if faph_at_cutoffs[index] == 0:
+            target_faph_cutoff_probability = cutoff
+            recall_at_no_faph = recall_at_cutoffs[index]
+            break
+
+    if faph_at_cutoffs[0] > 2:
+        index_of_first_viable = 1
+        while faph_at_cutoffs[index_of_first_viable] > 2:
+            index_of_first_viable += 1
+
+        x0 = faph_at_cutoffs[index_of_first_viable - 1]
+        y0 = recall_at_cutoffs[index_of_first_viable - 1]
+        x1 = faph_at_cutoffs[index_of_first_viable]
+        y1 = recall_at_cutoffs[index_of_first_viable]
+        recall_at_2faph = (y0 * (x1 - 2.0) + y1 * (2.0 - x0)) / (x1 - x0)
+    else:
+        index_of_first_viable = 0
+        recall_at_2faph = recall_at_cutoffs[0]
+
+    x_coordinates = [2.0]
+    y_coordinates = [recall_at_2faph]
+    for index in range(index_of_first_viable, len(recall_at_cutoffs)):
+        if faph_at_cutoffs[index] != x_coordinates[-1]:
+            x_coordinates.append(faph_at_cutoffs[index])
+            y_coordinates.append(recall_at_cutoffs[index])
+
+    metrics["recall_at_no_faph"] = recall_at_no_faph
+    metrics["cutoff_for_no_faph"] = target_faph_cutoff_probability
+    metrics["ambient_false_positives"] = ambient_false_positives[50]
+    metrics["ambient_false_positives_per_hour"] = faph_at_cutoffs[50]
+    metrics["average_viable_recall"] = (
+        np.trapz(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
+    )
+    return metrics
+
+
 def train(model, config, data_processor):
     skip_nonstreaming_validation = (
         os.environ.get("MICRO_BENCH_SKIP_VALIDATION", "0") == "1"
     )
+    full_validation_every = env_int("MICRO_FULL_VALIDATION_EVERY", 4, minimum=1)
     # Assign default training settings if not set in the configuration yaml
     if not (training_steps_list := config.get("training_steps")):
         training_steps_list = [20000]
@@ -391,14 +549,19 @@ def train(model, config, data_processor):
                 )
                 continue
 
-            nonstreaming_metrics = validate_nonstreaming(
-                config, data_processor, model, "validation"
+            validation_mode = "full"
+            if not is_last_step and (current_eval_batch % full_validation_every) != 0:
+                validation_mode = "fast"
+
+            nonstreaming_metrics = validate_nonstreaming_with_policy(
+                config, data_processor, model, "validation", validation_mode
             )
             model.reset_metrics()  # reset metrics for next validation epoch of training
             logging.info(
-                "Step %d (nonstreaming): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
+                "Step %d (nonstreaming/%s): Validation: recall at no faph = %.3f with cutoff %.2f, accuracy = %.2f%%, recall = %.2f%%, precision = %.2f%%, ambient false positives = %d, estimated false positives per hour = %.5f, loss = %.5f, auc = %.5f, average viable recall = %.9f",
                 *(
                     training_step,
+                    validation_mode,
                     nonstreaming_metrics["recall_at_no_faph"] * 100,
                     nonstreaming_metrics["cutoff_for_no_faph"],
                     nonstreaming_metrics["accuracy"] * 100,
@@ -440,6 +603,11 @@ def train(model, config, data_processor):
                     nonstreaming_metrics["average_viable_recall"],
                     step=training_step,
                 )
+                tf.summary.scalar(
+                    "is_full_validation",
+                    float(nonstreaming_metrics["is_full_validation"]),
+                    step=training_step,
+                )
                 validation_writer.flush()
 
             os.makedirs(os.path.join(config["train_dir"], "train"), exist_ok=True)
@@ -452,57 +620,58 @@ def train(model, config, data_processor):
                 )
             )
 
-            current_minimization_quantity = 0.0
-            if config["minimization_metric"] is not None:
-                current_minimization_quantity = nonstreaming_metrics[
-                    config["minimization_metric"]
+            if nonstreaming_metrics["is_full_validation"]:
+                current_minimization_quantity = 0.0
+                if config["minimization_metric"] is not None:
+                    current_minimization_quantity = nonstreaming_metrics[
+                        config["minimization_metric"]
+                    ]
+                current_maximization_quantity = nonstreaming_metrics[
+                    config["maximization_metric"]
                 ]
-            current_maximization_quantity = nonstreaming_metrics[
-                config["maximization_metric"]
-            ]
-            current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
+                current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
 
-            # Save model weights if this is a new best model
-            if (
-                (
+                # Save model weights if this is a new best model
+                if (
                     (
-                        current_minimization_quantity <= config["target_minimization"]
-                    )  # achieved target false positive rate
-                    and (
                         (
-                            current_maximization_quantity > best_maximization_quantity
-                        )  # either accuracy improved
-                        or (
-                            best_minimization_quantity > config["target_minimization"]
-                        )  # or this is the first time we met the target
+                            current_minimization_quantity <= config["target_minimization"]
+                        )
+                        and (
+                            (
+                                current_maximization_quantity > best_maximization_quantity
+                            )
+                            or (
+                                best_minimization_quantity > config["target_minimization"]
+                            )
+                        )
                     )
-                )
-                or (
-                    (
-                        current_minimization_quantity > config["target_minimization"]
-                    )  # we haven't achieved our target
-                    and (
-                        current_minimization_quantity < best_minimization_quantity
-                    )  # but we have decreased since the previous best
-                )
-                or (
-                    (
-                        current_minimization_quantity == best_minimization_quantity
-                    )  # we tied a previous best
-                    and (
-                        current_maximization_quantity > best_maximization_quantity
-                    )  # and we increased our accuracy
-                )
-            ):
-                best_minimization_quantity = current_minimization_quantity
-                best_maximization_quantity = current_maximization_quantity
-                best_no_faph_cutoff = current_no_faph_cutoff
+                    or (
+                        (
+                            current_minimization_quantity > config["target_minimization"]
+                        )
+                        and (
+                            current_minimization_quantity < best_minimization_quantity
+                        )
+                    )
+                    or (
+                        (
+                            current_minimization_quantity == best_minimization_quantity
+                        )
+                        and (
+                            current_maximization_quantity > best_maximization_quantity
+                        )
+                    )
+                ):
+                    best_minimization_quantity = current_minimization_quantity
+                    best_maximization_quantity = current_maximization_quantity
+                    best_no_faph_cutoff = current_no_faph_cutoff
 
-                # overwrite the best model weights
-                model.save_weights(
-                    os.path.join(config["train_dir"], "best_weights.weights.h5")
-                )
-                checkpoint.save(file_prefix=checkpoint_prefix)
+                    # overwrite the best model weights
+                    model.save_weights(
+                        os.path.join(config["train_dir"], "best_weights.weights.h5")
+                    )
+                    checkpoint.save(file_prefix=checkpoint_prefix)
 
             logging.info(
                 "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
