@@ -18,6 +18,8 @@ import os
 import platform
 import contextlib
 import random
+import multiprocessing as mp
+import json
 
 from absl import logging
 
@@ -25,6 +27,7 @@ import numpy as np
 import tensorflow as tf
 
 from tensorflow.python.util import tf_decorator
+import microwakeword.data as data_lib
 
 
 @contextlib.contextmanager
@@ -62,12 +65,53 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
+def apply_optional_device_prefetch(dataset: tf.data.Dataset) -> tf.data.Dataset:
+    """Optionally copy batches to a device before consumption by the model."""
+    prefetch_device = os.environ.get("MICRO_TRAIN_PREFETCH_DEVICE", "off").strip()
+    prefetch_mode = prefetch_device.lower()
+    if prefetch_mode in {"", "off", "none", "0", "false"}:
+        return dataset
+
+    target_device = None
+    if prefetch_mode in {"auto", "gpu"}:
+        gpus = tf.config.list_logical_devices("GPU")
+        if gpus:
+            target_device = gpus[0].name
+        elif prefetch_mode == "gpu":
+            logging.warning(
+                "MICRO_TRAIN_PREFETCH_DEVICE=%s requested but no GPU found",
+                prefetch_device,
+            )
+            return dataset
+    elif prefetch_mode == "cpu":
+        target_device = "/CPU:0"
+    else:
+        target_device = prefetch_device
+
+    if not target_device:
+        return dataset
+
+    try:
+        dataset = dataset.apply(tf.data.experimental.copy_to_device(target_device))
+        dataset = dataset.prefetch(1)
+        logging.info("Training device prefetch enabled: %s", target_device)
+        return dataset
+    except Exception as exc:
+        logging.warning(
+            "Failed to enable training device prefetch on %s: %s",
+            target_device,
+            exc,
+        )
+        return dataset
+
+
 def make_streaming_eval_dataset(
     config,
     data_processor,
     data_set: str,
     truncation_strategy: str,
     max_samples: int = 0,
+    repeat: bool = False,
 ):
     feature_shape = tuple(config["training_input_shape"])
 
@@ -125,7 +169,408 @@ def make_streaming_eval_dataset(
             tf.TensorSpec(shape=(1,), dtype=tf.float32),
         ),
     )
-    return dataset.batch(nonstreaming_eval_batch_size()).prefetch(tf.data.AUTOTUNE)
+    dataset = dataset.batch(nonstreaming_eval_batch_size())
+    if repeat:
+        dataset = dataset.repeat()
+    return dataset.prefetch(tf.data.AUTOTUNE)
+
+
+def eval_steps_for_mode(data_processor, data_set: str, max_samples: int = 0) -> int:
+    """Compute deterministic evaluate() steps for finite datasets."""
+    total_samples = int(data_processor.get_mode_size(data_set))
+    if max_samples > 0:
+        total_samples = min(total_samples, int(max_samples))
+    total_samples = max(1, total_samples)
+    return int(np.ceil(total_samples / float(nonstreaming_eval_batch_size())))
+
+
+def build_training_dataset(config, data_processor, policy_ref):
+    """Create a repeating tf.data pipeline for training samples."""
+    feature_shape = tuple(config["training_input_shape"])
+    features_length = int(config["spectrogram_length"])
+    providers = [
+        provider
+        for provider in data_processor.feature_providers
+        if provider.get_mode_size("training")
+    ]
+    if not providers:
+        raise ValueError("No training feature providers available.")
+
+    provider_weights = np.asarray(
+        [max(0.0, float(provider.sampling_weight)) for provider in providers],
+        dtype=np.float64,
+    )
+    if float(np.sum(provider_weights)) <= 0.0:
+        provider_weights = np.ones(len(providers), dtype=np.float64)
+    provider_probs = provider_weights / np.sum(provider_weights)
+
+    batch_size = int(config["batch_size"])
+    default_workers = max(1, (os.cpu_count() or 1) - 1)
+    data_workers = env_int(
+        "MICRO_TRAIN_DATA_WORKERS",
+        default_workers,
+        minimum=0,
+    )
+    queue_factor = env_int("MICRO_TRAIN_DATA_QUEUE_FACTOR", 3, minimum=1)
+    start_method = os.environ.get("MICRO_TRAIN_DATA_START_METHOD", "fork").strip().lower()
+    if start_method not in {"fork", "spawn", "forkserver"}:
+        logging.warning(
+            "Invalid MICRO_TRAIN_DATA_START_METHOD=%r, falling back to 'fork'",
+            start_method,
+        )
+        start_method = "fork"
+
+    def build_numpy_batch(policy):
+        x = np.empty((batch_size, *feature_shape), dtype=np.float32)
+        y = np.empty((batch_size, 1), dtype=np.float32)
+        w = np.empty((batch_size, 1), dtype=np.float32)
+        s = np.empty((batch_size, 1), dtype=np.float32)
+        for i in range(batch_size):
+            provider_idx = int(np.random.choice(len(providers), p=provider_probs))
+            provider = providers[provider_idx]
+            soft_label = np.nan
+            if hasattr(provider, "get_random_example"):
+                (
+                    spectrogram,
+                    sampled_label,
+                    sampled_weight,
+                    soft_label,
+                ) = provider.get_random_example(
+                    "training", features_length, "default"
+                )
+            else:
+                spectrogram = provider.get_random_spectrogram(
+                    "training", features_length, "default"
+                )
+                sampled_label = float(provider.label)
+                sampled_weight = float(provider.penalty_weight)
+
+            spectrogram = data_lib.spec_augment(
+                spectrogram,
+                int(policy["time_mask_max_size"]),
+                int(policy["time_mask_count"]),
+                int(policy["freq_mask_max_size"]),
+                int(policy["freq_mask_count"]),
+            )
+            x[i] = np.asarray(spectrogram, dtype=np.float32)
+            y[i, 0] = np.float32(sampled_label)
+            w[i, 0] = np.float32(sampled_weight)
+            s[i, 0] = np.float32(soft_label) if np.isfinite(soft_label) else np.float32(np.nan)
+        return x, y, w, s
+
+    def sample_generator_single():
+        while True:
+            yield build_numpy_batch(policy_ref["value"])
+
+    def _worker_loop(request_q, result_q):
+        while True:
+            policy = request_q.get()
+            if policy is None:
+                break
+            result_q.put(build_numpy_batch(policy))
+
+    def sample_generator_mp():
+        worker_count = max(2, data_workers)
+        queue_depth = max(worker_count * queue_factor, worker_count + 1)
+        ctx = mp.get_context(start_method)
+        request_q = ctx.Queue(maxsize=queue_depth)
+        result_q = ctx.Queue(maxsize=queue_depth)
+        workers = []
+        logging.info(
+            "Training tf.data multiprocessing enabled: workers=%d start_method=%s queue_depth=%d",
+            worker_count,
+            start_method,
+            queue_depth,
+        )
+        for _ in range(worker_count):
+            proc = ctx.Process(target=_worker_loop, args=(request_q, result_q), daemon=True)
+            proc.start()
+            workers.append(proc)
+
+        for _ in workers:
+            request_q.put(policy_ref["value"])
+
+        try:
+            while True:
+                batch = result_q.get()
+                request_q.put(policy_ref["value"])
+                yield batch
+        finally:
+            for _ in workers:
+                try:
+                    request_q.put_nowait(None)
+                except Exception:
+                    pass
+            for proc in workers:
+                proc.join(timeout=1.0)
+                if proc.is_alive():
+                    proc.terminate()
+            request_q.close()
+            result_q.close()
+
+    dataset = tf.data.Dataset.from_generator(
+        sample_generator_mp if data_workers > 1 else sample_generator_single,
+        output_signature=(
+            tf.TensorSpec(shape=(batch_size, *feature_shape), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size, 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size, 1), dtype=tf.float32),
+            tf.TensorSpec(shape=(batch_size, 1), dtype=tf.float32),
+        ),
+    )
+    if data_workers <= 1:
+        logging.info("Training tf.data multiprocessing disabled: workers=%d", data_workers)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = apply_optional_device_prefetch(dataset)
+    return dataset
+
+
+def _bytes_feature(value: bytes) -> tf.train.Feature:
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+
+def _float_feature(value: float) -> tf.train.Feature:
+    return tf.train.Feature(float_list=tf.train.FloatList(value=[float(value)]))
+
+
+def build_tfrecord_training_dataset(config, data_processor):
+    """Create (or reuse) TFRecord training cache and build tf.data pipeline from it."""
+    feature_shape = tuple(config["training_input_shape"])
+    features_length = int(config["spectrogram_length"])
+    batch_size = int(config["batch_size"])
+    default_examples = max(8192, batch_size * 64)
+    record_count = env_int("MICRO_TRAIN_TFRECORD_EXAMPLES", default_examples, minimum=batch_size)
+    shuffle_buffer = env_int(
+        "MICRO_TRAIN_TFRECORD_SHUFFLE_BUFFER",
+        min(16384, max(2048, record_count // 2)),
+        minimum=batch_size,
+    )
+    rebuild_cache = os.environ.get("MICRO_TRAIN_TFRECORD_REBUILD", "0").strip() == "1"
+    cache_mode = os.environ.get("MICRO_TRAIN_TFRECORD_CACHE_MODE", "none").strip().lower()
+    if cache_mode not in {"none", "auto", "ram", "file"}:
+        logging.warning(
+            "Invalid MICRO_TRAIN_TFRECORD_CACHE_MODE=%r, falling back to 'none'",
+            cache_mode,
+        )
+        cache_mode = "none"
+    cache_ram_mb = env_int("MICRO_TRAIN_TFRECORD_CACHE_RAM_MB", 4096, minimum=256)
+    cache_file_path = os.environ.get("MICRO_TRAIN_TFRECORD_CACHE_FILE", "").strip()
+    cache_dir = os.environ.get(
+        "MICRO_TRAIN_TFRECORD_CACHE_DIR",
+        os.path.join(config["train_dir"], "input_tfrecord"),
+    ).strip()
+    if not cache_dir:
+        cache_dir = os.path.join(config["train_dir"], "input_tfrecord")
+    os.makedirs(cache_dir, exist_ok=True)
+    tfrecord_path = os.path.join(cache_dir, f"train_{record_count}.tfrecord")
+    metadata_path = os.path.join(cache_dir, f"train_{record_count}.meta.json")
+
+    providers = [
+        provider
+        for provider in data_processor.feature_providers
+        if provider.get_mode_size("training")
+    ]
+    if not providers:
+        raise ValueError("No training feature providers available.")
+    provider_weights = np.asarray(
+        [max(0.0, float(provider.sampling_weight)) for provider in providers],
+        dtype=np.float64,
+    )
+    if float(np.sum(provider_weights)) <= 0.0:
+        provider_weights = np.ones(len(providers), dtype=np.float64)
+    provider_probs = provider_weights / np.sum(provider_weights)
+
+    if rebuild_cache or (not os.path.isfile(tfrecord_path)):
+        logging.info(
+            "Building TFRecord training cache: %s (examples=%d)",
+            tfrecord_path,
+            record_count,
+        )
+        writer = tf.io.TFRecordWriter(tfrecord_path)
+        try:
+            for i in range(record_count):
+                provider_idx = int(np.random.choice(len(providers), p=provider_probs))
+                provider = providers[provider_idx]
+                soft_label = np.nan
+                if hasattr(provider, "get_random_example"):
+                    (
+                        spectrogram,
+                        sampled_label,
+                        sampled_weight,
+                        soft_label,
+                    ) = provider.get_random_example("training", features_length, "default")
+                else:
+                    spectrogram = provider.get_random_spectrogram(
+                        "training", features_length, "default"
+                    )
+                    sampled_label = float(provider.label)
+                    sampled_weight = float(provider.penalty_weight)
+
+                spectrogram = np.asarray(spectrogram, dtype=np.float32)
+                if spectrogram.shape != feature_shape:
+                    spectrogram = data_lib.fixed_length_spectrogram(
+                        spectrogram, features_length, "truncate_start", 0
+                    )
+                    spectrogram = np.asarray(spectrogram, dtype=np.float32)
+                spectrogram_fp16 = spectrogram.astype(np.float16, copy=False)
+                soft = (
+                    float(soft_label)
+                    if np.isfinite(soft_label)
+                    else float("nan")
+                )
+                example = tf.train.Example(
+                    features=tf.train.Features(
+                        feature={
+                            "x": _bytes_feature(spectrogram_fp16.tobytes()),
+                            "y": _float_feature(float(sampled_label)),
+                            "w": _float_feature(float(sampled_weight)),
+                            "s": _float_feature(soft),
+                        }
+                    )
+                )
+                writer.write(example.SerializeToString())
+                if (i + 1) % 5000 == 0:
+                    logging.info(
+                        "TFRecord cache progress: %d/%d examples",
+                        i + 1,
+                        record_count,
+                    )
+        finally:
+            writer.close()
+
+        with open(metadata_path, "w", encoding="utf-8") as meta_out:
+            json.dump(
+                {
+                    "record_count": record_count,
+                    "feature_shape": list(feature_shape),
+                    "features_length": features_length,
+                    "provider_count": len(providers),
+                },
+                meta_out,
+                indent=2,
+            )
+    else:
+        logging.info("Reusing TFRecord training cache: %s", tfrecord_path)
+
+    flat_size = int(np.prod(feature_shape))
+    feature_spec = {
+        "x": tf.io.FixedLenFeature([], tf.string),
+        "y": tf.io.FixedLenFeature([], tf.float32),
+        "w": tf.io.FixedLenFeature([], tf.float32),
+        "s": tf.io.FixedLenFeature([], tf.float32),
+    }
+
+    def _parse_record(serialized):
+        parsed = tf.io.parse_single_example(serialized, feature_spec)
+        x = tf.io.decode_raw(parsed["x"], tf.float16)
+        x = tf.reshape(x, (flat_size,))
+        x = tf.cast(x, tf.float32)
+        x = tf.reshape(x, feature_shape)
+        y = tf.reshape(parsed["y"], (1,))
+        w = tf.reshape(parsed["w"], (1,))
+        s = tf.reshape(parsed["s"], (1,))
+        return x, y, w, s
+
+    dataset = tf.data.TFRecordDataset(
+        tfrecord_path, num_parallel_reads=tf.data.AUTOTUNE
+    )
+    dataset = dataset.map(_parse_record, num_parallel_calls=tf.data.AUTOTUNE)
+
+    # Optional dataset cache layer before shuffle/repeat to reduce disk IO.
+    # Default "auto": cache in RAM when estimated record size fits configured budget.
+    chosen_cache_mode = "none"
+    if cache_mode == "ram":
+        dataset = dataset.cache()
+        chosen_cache_mode = "ram"
+    elif cache_mode == "file":
+        if not cache_file_path:
+            cache_file_path = os.path.join(cache_dir, f"train_{record_count}.dataset_cache")
+        dataset = dataset.cache(cache_file_path)
+        chosen_cache_mode = f"file:{cache_file_path}"
+    elif cache_mode == "auto":
+        estimated_bytes = int(record_count * (flat_size * 2 + 16))
+        if estimated_bytes <= (int(cache_ram_mb) * 1024 * 1024):
+            dataset = dataset.cache()
+            chosen_cache_mode = "ram(auto)"
+
+    dataset = dataset.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
+    dataset = dataset.repeat()
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    dataset = apply_optional_device_prefetch(dataset)
+    logging.info(
+        "Training TFRecord pipeline enabled: records=%d, batch=%d, shuffle_buffer=%d, cache=%s",
+        record_count,
+        batch_size,
+        shuffle_buffer,
+        chosen_cache_mode,
+    )
+    if cache_mode == "auto":
+        logging.info(
+            "TFRecord cache auto decision: estimated=%.1fMB threshold=%dMB",
+            estimated_bytes / (1024.0 * 1024.0),
+            cache_ram_mb,
+        )
+    return dataset
+
+
+def tf_spec_augment_batch(
+    batch: tf.Tensor,
+    time_mask_max_size: int,
+    time_mask_count: int,
+    freq_mask_max_size: int,
+    freq_mask_count: int,
+) -> tf.Tensor:
+    """Apply SpecAugment with TensorFlow ops on a [B, T, F] batch."""
+    if (
+        time_mask_max_size <= 0
+        or time_mask_count <= 0
+    ) and (
+        freq_mask_max_size <= 0
+        or freq_mask_count <= 0
+    ):
+        return batch
+
+    def _apply_single(spec):
+        out = spec
+        time_frames = tf.shape(out)[0]
+        freq_bins = tf.shape(out)[1]
+
+        for _ in range(max(0, int(time_mask_count))):
+            max_t = tf.minimum(tf.cast(time_mask_max_size, tf.int32), time_frames)
+            t = tf.random.uniform([], minval=0, maxval=max_t + 1, dtype=tf.int32)
+            max_start = tf.maximum(time_frames - t + 1, 1)
+            t0 = tf.random.uniform([], minval=0, maxval=max_start, dtype=tf.int32)
+            mask = tf.concat(
+                [
+                    tf.ones((t0,), dtype=out.dtype),
+                    tf.zeros((t,), dtype=out.dtype),
+                    tf.ones((time_frames - t0 - t,), dtype=out.dtype),
+                ],
+                axis=0,
+            )
+            out = out * tf.expand_dims(mask, axis=1)
+
+        for _ in range(max(0, int(freq_mask_count))):
+            max_f = tf.minimum(tf.cast(freq_mask_max_size, tf.int32), freq_bins)
+            f = tf.random.uniform([], minval=0, maxval=max_f + 1, dtype=tf.int32)
+            max_start = tf.maximum(freq_bins - f + 1, 1)
+            f0 = tf.random.uniform([], minval=0, maxval=max_start, dtype=tf.int32)
+            mask = tf.concat(
+                [
+                    tf.ones((f0,), dtype=out.dtype),
+                    tf.zeros((f,), dtype=out.dtype),
+                    tf.ones((freq_bins - f0 - f,), dtype=out.dtype),
+                ],
+                axis=0,
+            )
+            out = out * tf.expand_dims(mask, axis=0)
+
+        return out
+
+    augmented = tf.map_fn(_apply_single, batch, fn_output_signature=tf.float32)
+    # Keep static shape information for downstream Keras layers (Conv2D).
+    augmented.set_shape(batch.shape)
+    return augmented
 
 
 def validate_nonstreaming(config, data_processor, model, test_set):
@@ -140,9 +585,12 @@ def validate_nonstreaming(config, data_processor, model, test_set):
         test_set,
         truncation_strategy="truncate_start",
         max_samples=0,
+        repeat=True,
     )
+    testing_steps = eval_steps_for_mode(data_processor, test_set, max_samples=0)
     result = model.evaluate(
         testing_dataset,
+        steps=testing_steps,
         return_dict=True,
         verbose=0,
     )
@@ -268,9 +716,12 @@ def validate_nonstreaming_with_policy(config, data_processor, model, test_set, m
         test_set,
         truncation_strategy="truncate_start",
         max_samples=max_samples,
+        repeat=True,
     )
+    testing_steps = eval_steps_for_mode(data_processor, test_set, max_samples=max_samples)
     result = model.evaluate(
         testing_dataset,
+        steps=testing_steps,
         return_dict=True,
         verbose=0,
     )
@@ -447,6 +898,24 @@ def train(model, config, data_processor):
     best_minimization_quantity = 10000
     best_maximization_quantity = 0.0
     best_no_faph_cutoff = 1.0
+    current_policy_ref = {
+        "value": {
+            "mix_up_prob": 0.0,
+            "freq_mix_prob": 0.0,
+            "time_mask_max_size": 0,
+            "time_mask_count": 0,
+            "freq_mask_max_size": 0,
+            "freq_mask_count": 0,
+        }
+    }
+    input_mode = os.environ.get("MICRO_TRAIN_INPUT_MODE", "python").strip().lower()
+    if input_mode == "tfrecord":
+        training_dataset = build_tfrecord_training_dataset(config, data_processor)
+    else:
+        input_mode = "python"
+        training_dataset = build_training_dataset(config, data_processor, current_policy_ref)
+    logging.info("Training input mode: %s", input_mode)
+    training_iterator = iter(training_dataset)
 
     for training_step in range(1, training_steps_max + 1):
         training_steps_sum = 0
@@ -474,41 +943,52 @@ def train(model, config, data_processor):
             "freq_mask_max_size": freq_mask_max_size,
             "freq_mask_count": freq_mask_count,
         }
+        current_policy_ref["value"] = augmentation_policy
 
         (
             train_fingerprints,
             train_ground_truth,
             train_sample_weights,
             train_soft_labels,
-        ) = data_processor.get_data(
-            "training",
-            batch_size=config["batch_size"],
-            features_length=config["spectrogram_length"],
-            truncation_strategy="default",
-            augmentation_policy=augmentation_policy,
+        ) = next(training_iterator)
+
+        x_batch = tf.convert_to_tensor(train_fingerprints, dtype=tf.float32)
+        y_batch = tf.reshape(
+            tf.convert_to_tensor(train_ground_truth, dtype=tf.float32), (-1, 1)
+        )
+        base_weights_batch = tf.reshape(
+            tf.convert_to_tensor(train_sample_weights, dtype=tf.float32), (-1, 1)
+        )
+        soft_batch = tf.reshape(
+            tf.convert_to_tensor(train_soft_labels, dtype=tf.float32), (-1, 1)
         )
 
-        train_ground_truth = train_ground_truth.reshape(-1, 1)
-        train_soft_labels = train_soft_labels.reshape(-1, 1)
-
-        ground_truth_flat = train_ground_truth.reshape(-1)
-        sample_weights_flat = train_sample_weights.reshape(-1)
-        class_weight_vector = np.where(
-            ground_truth_flat >= 0.5, positive_class_weight, negative_class_weight
-        ).astype(np.float32)
-        combined_weights_flat = (sample_weights_flat * class_weight_vector).astype(
-            np.float32
+        # Apply SpecAugment in TF ops for both input modes.
+        x_batch = tf_spec_augment_batch(
+            x_batch,
+            int(time_mask_max_size),
+            int(time_mask_count),
+            int(freq_mask_max_size),
+            int(freq_mask_count),
         )
 
-        distillation_mask = np.isfinite(train_soft_labels).astype(np.float32)
+        class_weight_vector = tf.where(
+            y_batch >= 0.5,
+            tf.cast(float(positive_class_weight), tf.float32),
+            tf.cast(float(negative_class_weight), tf.float32),
+        )
+        combined_weights = base_weights_batch * class_weight_vector
+        combined_weights_flat = tf.reshape(combined_weights, (-1,))
+
+        finite_soft_mask = tf.cast(tf.math.is_finite(soft_batch), tf.float32)
         distillation_active = distillation_enabled and bool(
-            np.any(distillation_mask > 0.0)
+            tf.reduce_any(finite_soft_mask > 0.0).numpy()
         )
 
         if not distillation_active:
             result = model.train_on_batch(
-                train_fingerprints,
-                train_ground_truth,
+                x_batch,
+                y_batch,
                 sample_weight=combined_weights_flat,
             )
             train_accuracy = float(result[1])
@@ -519,13 +999,7 @@ def train(model, config, data_processor):
             train_distill_loss = 0.0
             train_total_loss = train_hard_loss
         else:
-            x_batch = tf.convert_to_tensor(train_fingerprints, dtype=tf.float32)
-            y_batch = tf.convert_to_tensor(train_ground_truth, dtype=tf.float32)
-            w_batch = tf.reshape(
-                tf.convert_to_tensor(combined_weights_flat, dtype=tf.float32), (-1, 1)
-            )
-            soft_batch = tf.convert_to_tensor(train_soft_labels, dtype=tf.float32)
-            finite_soft_mask = tf.cast(tf.math.is_finite(soft_batch), tf.float32)
+            w_batch = tf.reshape(combined_weights_flat, (-1, 1))
 
             with tf.GradientTape() as tape:
                 y_pred = model(x_batch, training=True)
