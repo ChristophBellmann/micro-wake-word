@@ -71,6 +71,17 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return max(minimum, float(value))
+    except ValueError:
+        logging.warning("Invalid %s=%r, falling back to %.6f", name, value, default)
+        return default
+
+
 def apply_optional_device_prefetch(dataset: tf.data.Dataset) -> tf.data.Dataset:
     """Optionally copy batches to a device before consumption by the model."""
     prefetch_device = os.environ.get("MICRO_TRAIN_PREFETCH_DEVICE", "off").strip()
@@ -188,6 +199,45 @@ def eval_steps_for_mode(data_processor, data_set: str, max_samples: int = 0) -> 
         total_samples = min(total_samples, int(max_samples))
     total_samples = max(1, total_samples)
     return int(np.ceil(total_samples / float(nonstreaming_eval_batch_size())))
+
+
+def full_validation_is_better(
+    current_metrics: dict,
+    target_minimization: float,
+    minimization_metric: str | None,
+    maximization_metric: str,
+    best_minimization_quantity: float,
+    best_maximization_quantity: float,
+) -> tuple[bool, float, float, float]:
+    current_minimization_quantity = 0.0
+    if minimization_metric is not None:
+        current_minimization_quantity = float(current_metrics[minimization_metric])
+    current_maximization_quantity = float(current_metrics[maximization_metric])
+    current_no_faph_cutoff = float(current_metrics["cutoff_for_no_faph"])
+
+    improved = (
+        (
+            (current_minimization_quantity <= target_minimization)
+            and (
+                (current_maximization_quantity > best_maximization_quantity)
+                or (best_minimization_quantity > target_minimization)
+            )
+        )
+        or (
+            (current_minimization_quantity > target_minimization)
+            and (current_minimization_quantity < best_minimization_quantity)
+        )
+        or (
+            (current_minimization_quantity == best_minimization_quantity)
+            and (current_maximization_quantity > best_maximization_quantity)
+        )
+    )
+    return (
+        improved,
+        current_minimization_quantity,
+        current_maximization_quantity,
+        current_no_faph_cutoff,
+    )
 
 
 def iter_nonstreaming_eval_batches(
@@ -1220,6 +1270,20 @@ def train(model, config, data_processor):
     best_minimization_quantity = 10000
     best_maximization_quantity = 0.0
     best_no_faph_cutoff = 1.0
+    full_validation_lr_patience = env_int("MICRO_TRAIN_FULL_LR_PATIENCE", 2, minimum=1)
+    full_validation_early_stop_patience = env_int(
+        "MICRO_TRAIN_FULL_EARLY_STOP_PATIENCE", 6, minimum=1
+    )
+    full_validation_max_lr_reductions = env_int(
+        "MICRO_TRAIN_FULL_MAX_LR_REDUCTIONS", 3, minimum=1
+    )
+    full_validation_lr_factor = env_float("MICRO_TRAIN_FULL_LR_FACTOR", 0.5, minimum=0.0)
+    full_validation_min_lr = env_float("MICRO_TRAIN_FULL_MIN_LR", 1e-5, minimum=0.0)
+    learning_rate_decay_multiplier = 1.0
+    full_validation_no_improve_count = 0
+    full_validation_no_improve_since_lr_drop = 0
+    full_validation_lr_reductions = 0
+    stop_requested = False
     current_policy_ref = {
         "value": {
             "mix_up_prob": 0.0,
@@ -1244,7 +1308,8 @@ def train(model, config, data_processor):
         for i in range(len(training_steps_list)):
             training_steps_sum += training_steps_list[i]
             if training_step <= training_steps_sum:
-                learning_rate = learning_rates_list[i]
+                scheduled_learning_rate = learning_rates_list[i]
+                learning_rate = scheduled_learning_rate * learning_rate_decay_multiplier
                 mix_up_prob = mix_up_prob_list[i]
                 freq_mix_prob = freq_mix_prob_list[i]
                 time_mask_max_size = time_mask_max_size_list[i]
@@ -1439,57 +1504,76 @@ def train(model, config, data_processor):
             )
 
             if nonstreaming_metrics["is_full_validation"]:
-                current_minimization_quantity = 0.0
-                if config["minimization_metric"] is not None:
-                    current_minimization_quantity = nonstreaming_metrics[
-                        config["minimization_metric"]
-                    ]
-                current_maximization_quantity = nonstreaming_metrics[
-                    config["maximization_metric"]
-                ]
-                current_no_faph_cutoff = nonstreaming_metrics["cutoff_for_no_faph"]
+                (
+                    full_validation_improved,
+                    current_minimization_quantity,
+                    current_maximization_quantity,
+                    current_no_faph_cutoff,
+                ) = full_validation_is_better(
+                    nonstreaming_metrics,
+                    float(config["target_minimization"]),
+                    config["minimization_metric"],
+                    config["maximization_metric"],
+                    best_minimization_quantity,
+                    best_maximization_quantity,
+                )
 
                 # Save model weights if this is a new best model
-                if (
-                    (
-                        (
-                            current_minimization_quantity <= config["target_minimization"]
-                        )
-                        and (
-                            (
-                                current_maximization_quantity > best_maximization_quantity
-                            )
-                            or (
-                                best_minimization_quantity > config["target_minimization"]
-                            )
-                        )
-                    )
-                    or (
-                        (
-                            current_minimization_quantity > config["target_minimization"]
-                        )
-                        and (
-                            current_minimization_quantity < best_minimization_quantity
-                        )
-                    )
-                    or (
-                        (
-                            current_minimization_quantity == best_minimization_quantity
-                        )
-                        and (
-                            current_maximization_quantity > best_maximization_quantity
-                        )
-                    )
-                ):
+                if full_validation_improved:
                     best_minimization_quantity = current_minimization_quantity
                     best_maximization_quantity = current_maximization_quantity
                     best_no_faph_cutoff = current_no_faph_cutoff
+                    full_validation_no_improve_count = 0
+                    full_validation_no_improve_since_lr_drop = 0
 
                     # overwrite the best model weights
                     model.save_weights(
                         os.path.join(config["train_dir"], "best_weights.weights.h5")
                     )
                     checkpoint.save(file_prefix=checkpoint_prefix)
+                else:
+                    full_validation_no_improve_count += 1
+                    full_validation_no_improve_since_lr_drop += 1
+                    if (
+                        full_validation_no_improve_since_lr_drop
+                        >= full_validation_lr_patience
+                        and full_validation_lr_reductions
+                        < full_validation_max_lr_reductions
+                    ):
+                        next_learning_rate = (
+                            scheduled_learning_rate * learning_rate_decay_multiplier * full_validation_lr_factor
+                        )
+                        if next_learning_rate >= full_validation_min_lr:
+                            learning_rate_decay_multiplier *= full_validation_lr_factor
+                            full_validation_lr_reductions += 1
+                            full_validation_no_improve_since_lr_drop = 0
+                            model.optimizer.learning_rate.assign(
+                                scheduled_learning_rate * learning_rate_decay_multiplier
+                            )
+                            logging.info(
+                                "Full validation plateau: reducing learning rate to %f (scheduled=%f, multiplier=%f, reductions=%d/%d)",
+                                float(scheduled_learning_rate * learning_rate_decay_multiplier),
+                                float(scheduled_learning_rate),
+                                float(learning_rate_decay_multiplier),
+                                full_validation_lr_reductions,
+                                full_validation_max_lr_reductions,
+                            )
+                        else:
+                            logging.info(
+                                "Full validation plateau reached but next learning rate %f would fall below floor %f; keeping current rate",
+                                float(next_learning_rate),
+                                float(full_validation_min_lr),
+                            )
+
+                    if (
+                        full_validation_no_improve_count
+                        >= full_validation_early_stop_patience
+                    ):
+                        stop_requested = True
+                        logging.info(
+                            "Full validation early stop triggered after %d consecutive full validations without improvement",
+                            full_validation_no_improve_count,
+                        )
 
             logging.info(
                 "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
@@ -1497,6 +1581,14 @@ def train(model, config, data_processor):
                 (best_maximization_quantity * 100),
                 best_no_faph_cutoff,
             )
+
+            if stop_requested:
+                break
+
+    if stop_requested:
+        logging.info(
+            "Training stopped early after full-validation feedback exhausted the patience budget."
+        )
 
     # Save checkpoint after training
     checkpoint.save(file_prefix=checkpoint_prefix)
