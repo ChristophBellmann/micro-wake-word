@@ -369,6 +369,12 @@ def build_tfrecord_training_dataset(config, data_processor):
     os.makedirs(cache_dir, exist_ok=True)
     tfrecord_path = os.path.join(cache_dir, f"train_{record_count}.tfrecord")
     metadata_path = os.path.join(cache_dir, f"train_{record_count}.meta.json")
+    build_batch_size = env_int(
+        "MICRO_TRAIN_TFRECORD_BUILD_BATCH",
+        min(record_count, max(batch_size, 512)),
+        minimum=1,
+    )
+    build_batch_size = min(record_count, max(1, build_batch_size))
 
     providers = [
         provider
@@ -387,57 +393,54 @@ def build_tfrecord_training_dataset(config, data_processor):
 
     if rebuild_cache or (not os.path.isfile(tfrecord_path)):
         logging.info(
-            "Building TFRecord training cache: %s (examples=%d)",
+            "Building TFRecord training cache: %s (examples=%d, build_batch=%d)",
             tfrecord_path,
             record_count,
+            build_batch_size,
         )
         writer = tf.io.TFRecordWriter(tfrecord_path)
         try:
-            for i in range(record_count):
-                provider_idx = int(np.random.choice(len(providers), p=provider_probs))
-                provider = providers[provider_idx]
-                soft_label = np.nan
-                if hasattr(provider, "get_random_example"):
-                    (
-                        spectrogram,
-                        sampled_label,
-                        sampled_weight,
-                        soft_label,
-                    ) = provider.get_random_example("training", features_length, "default")
-                else:
-                    spectrogram = provider.get_random_spectrogram(
-                        "training", features_length, "default"
-                    )
-                    sampled_label = float(provider.label)
-                    sampled_weight = float(provider.penalty_weight)
+            written = 0
+            while written < record_count:
+                current_batch = min(build_batch_size, record_count - written)
+                batch_x, batch_y, batch_w, batch_s = data_processor.get_data(
+                    "training",
+                    current_batch,
+                    features_length,
+                    "default",
+                )
+                batch_x = np.asarray(batch_x, dtype=np.float32)
+                batch_y = np.asarray(batch_y, dtype=np.float32).reshape(-1)
+                batch_w = np.asarray(batch_w, dtype=np.float32).reshape(-1)
+                batch_s = np.asarray(batch_s, dtype=np.float32).reshape(-1)
 
-                spectrogram = np.asarray(spectrogram, dtype=np.float32)
-                if spectrogram.shape != feature_shape:
-                    spectrogram = data_lib.fixed_length_spectrogram(
-                        spectrogram, features_length, "truncate_start", 0
+                for batch_idx in range(current_batch):
+                    spectrogram = batch_x[batch_idx]
+                    if spectrogram.shape != feature_shape:
+                        spectrogram = data_lib.fixed_length_spectrogram(
+                            spectrogram, features_length, "truncate_start", 0
+                        )
+                        spectrogram = np.asarray(spectrogram, dtype=np.float32)
+                    spectrogram_fp16 = spectrogram.astype(np.float16, copy=False)
+                    soft_label = float(batch_s[batch_idx])
+                    soft = soft_label if np.isfinite(soft_label) else float("nan")
+                    example = tf.train.Example(
+                        features=tf.train.Features(
+                            feature={
+                                "x": _bytes_feature(spectrogram_fp16.tobytes()),
+                                "y": _float_feature(float(batch_y[batch_idx])),
+                                "w": _float_feature(float(batch_w[batch_idx])),
+                                "s": _float_feature(soft),
+                            }
+                        )
                     )
-                    spectrogram = np.asarray(spectrogram, dtype=np.float32)
-                spectrogram_fp16 = spectrogram.astype(np.float16, copy=False)
-                soft = (
-                    float(soft_label)
-                    if np.isfinite(soft_label)
-                    else float("nan")
-                )
-                example = tf.train.Example(
-                    features=tf.train.Features(
-                        feature={
-                            "x": _bytes_feature(spectrogram_fp16.tobytes()),
-                            "y": _float_feature(float(sampled_label)),
-                            "w": _float_feature(float(sampled_weight)),
-                            "s": _float_feature(soft),
-                        }
-                    )
-                )
-                writer.write(example.SerializeToString())
-                if (i + 1) % 5000 == 0:
+                    writer.write(example.SerializeToString())
+
+                written += current_batch
+                if written % 5000 == 0 or written == record_count:
                     logging.info(
                         "TFRecord cache progress: %d/%d examples",
-                        i + 1,
+                        written,
                         record_count,
                     )
         finally:
@@ -450,6 +453,7 @@ def build_tfrecord_training_dataset(config, data_processor):
                     "feature_shape": list(feature_shape),
                     "features_length": features_length,
                     "provider_count": len(providers),
+                    "build_batch_size": build_batch_size,
                 },
                 meta_out,
                 indent=2,
