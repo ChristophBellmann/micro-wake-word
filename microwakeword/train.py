@@ -190,6 +190,186 @@ def eval_steps_for_mode(data_processor, data_set: str, max_samples: int = 0) -> 
     return int(np.ceil(total_samples / float(nonstreaming_eval_batch_size())))
 
 
+def iter_nonstreaming_eval_batches(
+    config,
+    data_processor,
+    data_set: str,
+    truncation_strategy: str,
+    max_samples: int = 0,
+):
+    """Yield copied NumPy batches for nonstreaming eval without tf.data/from_generator."""
+    feature_shape = tuple(config["training_input_shape"])
+    features_length = int(config["spectrogram_length"])
+    batch_size = nonstreaming_eval_batch_size()
+
+    def iter_samples():
+        if max_samples > 0:
+            providers = list(data_processor.feature_providers)
+            random.shuffle(providers)
+            iterators = [
+                (
+                    provider,
+                    iter(
+                        provider.get_feature_generator(
+                            data_set,
+                            features_length=features_length,
+                            truncation_strategy=truncation_strategy,
+                        )
+                    ),
+                )
+                for provider in providers
+            ]
+            emitted = 0
+            while iterators and emitted < max_samples:
+                next_iterators = []
+                for provider, generator in iterators:
+                    try:
+                        spectrogram = next(generator)
+                    except StopIteration:
+                        continue
+                    yield provider, spectrogram
+                    emitted += 1
+                    if emitted >= max_samples:
+                        break
+                    next_iterators.append((provider, generator))
+                iterators = next_iterators
+            return
+
+        for provider in data_processor.feature_providers:
+            generator = provider.get_feature_generator(
+                data_set,
+                features_length=features_length,
+                truncation_strategy=truncation_strategy,
+            )
+            for spectrogram in generator:
+                yield provider, spectrogram
+
+    batch_x = []
+    batch_y = []
+    for provider, spectrogram in iter_samples():
+        spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
+        if spectrogram_np.shape != feature_shape:
+            spectrogram_np = np.asarray(
+                data_lib.fixed_length_spectrogram(
+                    spectrogram_np,
+                    features_length,
+                    truncation_strategy,
+                    0,
+                ),
+                dtype=np.float32,
+            )
+        batch_x.append(np.array(spectrogram_np, dtype=np.float32, copy=True))
+        batch_y.append(float(provider.label))
+        if len(batch_x) == batch_size:
+            yield (
+                np.stack(batch_x, axis=0),
+                np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
+            )
+            batch_x = []
+            batch_y = []
+
+    if batch_x:
+        yield (
+            np.stack(batch_x, axis=0),
+            np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
+        )
+
+
+def _compute_binary_metrics_from_outputs(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Compute binary classification metrics and threshold curves from flat arrays."""
+    y_true = np.asarray(y_true, dtype=np.float32).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float32).reshape(-1)
+    if y_true.size == 0 or y_pred.size == 0:
+        return {
+            "accuracy": 0.0,
+            "recall": 0.0,
+            "precision": 0.0,
+            "auc": 0.0,
+            "loss": 0.0,
+            "tp": np.zeros(101, dtype=np.float32),
+            "fp": np.zeros(101, dtype=np.float32),
+            "tn": np.zeros(101, dtype=np.float32),
+            "fn": np.zeros(101, dtype=np.float32),
+        }
+
+    clipped_pred = np.clip(y_pred, 1e-7, 1.0 - 1e-7)
+    positive_mask = y_true >= 0.5
+    predicted_positive = clipped_pred >= 0.5
+
+    tp_05 = float(np.sum(predicted_positive & positive_mask))
+    fp_05 = float(np.sum(predicted_positive & ~positive_mask))
+    tn_05 = float(np.sum((~predicted_positive) & (~positive_mask)))
+    fn_05 = float(np.sum((~predicted_positive) & positive_mask))
+    total = max(1.0, tp_05 + fp_05 + tn_05 + fn_05)
+
+    auc_metric = tf.keras.metrics.AUC()
+    auc_metric.update_state(
+        tf.convert_to_tensor(y_true.reshape(-1, 1), dtype=tf.float32),
+        tf.convert_to_tensor(clipped_pred.reshape(-1, 1), dtype=tf.float32),
+    )
+
+    thresholds = np.linspace(0.0, 1.0, 101, dtype=np.float32)
+    thresholded_positive = clipped_pred[:, None] >= thresholds[None, :]
+    positive_by_threshold = positive_mask[:, None]
+    tp = np.sum(thresholded_positive & positive_by_threshold, axis=0).astype(np.float32)
+    fp = np.sum(thresholded_positive & ~positive_by_threshold, axis=0).astype(np.float32)
+    tn = np.sum((~thresholded_positive) & ~positive_by_threshold, axis=0).astype(np.float32)
+    fn = np.sum((~thresholded_positive) & positive_by_threshold, axis=0).astype(np.float32)
+
+    return {
+        "accuracy": (tp_05 + tn_05) / total,
+        "recall": tp_05 / max(1.0, tp_05 + fn_05),
+        "precision": tp_05 / max(1.0, tp_05 + fp_05),
+        "auc": float(auc_metric.result().numpy()),
+        "loss": float(
+            np.mean(
+                -(
+                    y_true * np.log(clipped_pred)
+                    + (1.0 - y_true) * np.log(1.0 - clipped_pred)
+                )
+            )
+        ),
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+    }
+
+
+def run_nonstreaming_numpy_eval(
+    config,
+    data_processor,
+    model,
+    data_set: str,
+    truncation_strategy: str,
+    max_samples: int = 0,
+):
+    """Run nonstreaming eval in eager NumPy batches, bypassing tf.data generator ops."""
+    all_truth = []
+    all_pred = []
+    for batch_x, batch_y in iter_nonstreaming_eval_batches(
+        config,
+        data_processor,
+        data_set,
+        truncation_strategy=truncation_strategy,
+        max_samples=max_samples,
+    ):
+        pred_batch = model(tf.convert_to_tensor(batch_x, dtype=tf.float32), training=False)
+        all_truth.append(np.asarray(batch_y, dtype=np.float32).reshape(-1))
+        all_pred.append(np.asarray(pred_batch, dtype=np.float32).reshape(-1))
+
+    if not all_truth:
+        return {"y_true": np.zeros(0, dtype=np.float32), "y_pred": np.zeros(0, dtype=np.float32), **_compute_binary_metrics_from_outputs(np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32))}
+
+    y_true = np.concatenate(all_truth, axis=0)
+    y_pred = np.concatenate(all_pred, axis=0)
+    return {
+        "y_true": y_true,
+        "y_pred": y_pred,
+        **_compute_binary_metrics_from_outputs(y_true, y_pred),
+    }
+
+
 def build_training_dataset(config, data_processor, policy_ref):
     """Create a repeating tf.data pipeline for training samples."""
     feature_shape = tuple(config["training_input_shape"])
@@ -584,70 +764,55 @@ def tf_spec_augment_batch(
 
 
 def validate_nonstreaming(config, data_processor, model, test_set):
-    def as_array(value):
-        return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
-
-    model.reset_metrics()
-
-    testing_dataset = make_streaming_eval_dataset(
+    test_eval = run_nonstreaming_numpy_eval(
         config,
         data_processor,
+        model,
         test_set,
         truncation_strategy="truncate_start",
         max_samples=0,
-        repeat=True,
-    )
-    testing_steps = eval_steps_for_mode(data_processor, test_set, max_samples=0)
-    result = model.evaluate(
-        testing_dataset,
-        steps=testing_steps,
-        return_dict=True,
-        verbose=0,
     )
 
     metrics = {}
-    metrics["accuracy"] = result["accuracy"]
-    metrics["recall"] = result["recall"]
-    metrics["precision"] = result["precision"]
+    metrics["accuracy"] = test_eval["accuracy"]
+    metrics["recall"] = test_eval["recall"]
+    metrics["precision"] = test_eval["precision"]
 
-    metrics["auc"] = result["auc"]
-    metrics["loss"] = result["loss"]
+    metrics["auc"] = test_eval["auc"]
+    metrics["loss"] = test_eval["loss"]
     metrics["recall_at_no_faph"] = 0
     metrics["cutoff_for_no_faph"] = 0
     metrics["ambient_false_positives"] = 0
     metrics["ambient_false_positives_per_hour"] = 0
     metrics["average_viable_recall"] = 0
 
-    test_set_fp = as_array(result["fp"])
-
-    if data_processor.get_mode_size("validation_ambient") > 0:
-        # XXX: tf no longer provides a way to evaluate a model without updating metrics
-        with swap_attribute(model, "reset_metrics", lambda: None):
-            ambient_testing_dataset = make_streaming_eval_dataset(
-                config,
-                data_processor,
-                test_set + "_ambient",
-                truncation_strategy="split",
-                max_samples=0,
-            )
-            ambient_predictions = model.evaluate(
-                ambient_testing_dataset,
-                return_dict=True,
-                verbose=0,
-            )
-
-        duration_of_ambient_set = (
-            data_processor.get_mode_duration("validation_ambient") / 3600.0
+    ambient_mode = test_set + "_ambient"
+    if data_processor.get_mode_size(ambient_mode) > 0:
+        ambient_eval = run_nonstreaming_numpy_eval(
+            config,
+            data_processor,
+            model,
+            ambient_mode,
+            truncation_strategy="split",
+            max_samples=0,
         )
 
-        # Other than the false positive rate, all other metrics are accumulated across
-        # both test sets
-        all_true_positives = as_array(ambient_predictions["tp"])
-        ambient_false_positives = as_array(ambient_predictions["fp"]) - test_set_fp
-        all_false_negatives = as_array(ambient_predictions["fn"])
+        duration_of_ambient_set = data_processor.get_mode_duration(ambient_mode) / 3600.0
+        duration_of_ambient_set = max(duration_of_ambient_set, 1e-8)
 
-        metrics["auc"] = ambient_predictions["auc"]
-        metrics["loss"] = ambient_predictions["loss"]
+        combined_eval = _compute_binary_metrics_from_outputs(
+            np.concatenate([test_eval["y_true"], ambient_eval["y_true"]], axis=0),
+            np.concatenate([test_eval["y_pred"], ambient_eval["y_pred"]], axis=0),
+        )
+        all_true_positives = combined_eval["tp"]
+        ambient_false_positives = ambient_eval["fp"]
+        all_false_negatives = combined_eval["fn"]
+
+        metrics["auc"] = combined_eval["auc"]
+        metrics["loss"] = combined_eval["loss"]
+        metrics["accuracy"] = combined_eval["accuracy"]
+        metrics["recall"] = combined_eval["recall"]
+        metrics["precision"] = combined_eval["precision"]
 
         recall_at_cutoffs = (
             all_true_positives / (all_true_positives + all_false_negatives)
@@ -716,62 +881,54 @@ def validate_nonstreaming_with_policy(config, data_processor, model, test_set, m
         "is_full_validation": mode == "full",
     }
 
-    def as_array(value):
-        return value.numpy() if hasattr(value, "numpy") else np.asarray(value)
-
-    model.reset_metrics()
-    testing_dataset = make_streaming_eval_dataset(
+    test_eval = run_nonstreaming_numpy_eval(
         config,
         data_processor,
+        model,
         test_set,
         truncation_strategy="truncate_start",
         max_samples=max_samples,
-        repeat=True,
-    )
-    testing_steps = eval_steps_for_mode(data_processor, test_set, max_samples=max_samples)
-    result = model.evaluate(
-        testing_dataset,
-        steps=testing_steps,
-        return_dict=True,
-        verbose=0,
     )
 
-    metrics["accuracy"] = result["accuracy"]
-    metrics["recall"] = result["recall"]
-    metrics["precision"] = result["precision"]
-    metrics["auc"] = result["auc"]
-    metrics["loss"] = result["loss"]
+    metrics["accuracy"] = test_eval["accuracy"]
+    metrics["recall"] = test_eval["recall"]
+    metrics["precision"] = test_eval["precision"]
+    metrics["auc"] = test_eval["auc"]
+    metrics["loss"] = test_eval["loss"]
     metrics["recall_at_no_faph"] = 0
     metrics["cutoff_for_no_faph"] = 0
     metrics["ambient_false_positives"] = 0
     metrics["ambient_false_positives_per_hour"] = 0
     metrics["average_viable_recall"] = 0
 
-    if not include_ambient or data_processor.get_mode_size("validation_ambient") <= 0:
+    ambient_mode = test_set + "_ambient"
+    if not include_ambient or data_processor.get_mode_size(ambient_mode) <= 0:
         return metrics
 
-    test_set_fp = as_array(result["fp"])
-    with swap_attribute(model, "reset_metrics", lambda: None):
-        ambient_testing_dataset = make_streaming_eval_dataset(
-            config,
-            data_processor,
-            test_set + "_ambient",
-            truncation_strategy="split",
-            max_samples=0,
-        )
-        ambient_predictions = model.evaluate(
-            ambient_testing_dataset,
-            return_dict=True,
-            verbose=0,
-        )
+    ambient_eval = run_nonstreaming_numpy_eval(
+        config,
+        data_processor,
+        model,
+        ambient_mode,
+        truncation_strategy="split",
+        max_samples=0,
+    )
 
-    duration_of_ambient_set = data_processor.get_mode_duration("validation_ambient") / 3600.0
-    all_true_positives = as_array(ambient_predictions["tp"])
-    ambient_false_positives = as_array(ambient_predictions["fp"]) - test_set_fp
-    all_false_negatives = as_array(ambient_predictions["fn"])
+    duration_of_ambient_set = data_processor.get_mode_duration(ambient_mode) / 3600.0
+    duration_of_ambient_set = max(duration_of_ambient_set, 1e-8)
+    combined_eval = _compute_binary_metrics_from_outputs(
+        np.concatenate([test_eval["y_true"], ambient_eval["y_true"]], axis=0),
+        np.concatenate([test_eval["y_pred"], ambient_eval["y_pred"]], axis=0),
+    )
+    all_true_positives = combined_eval["tp"]
+    ambient_false_positives = ambient_eval["fp"]
+    all_false_negatives = combined_eval["fn"]
 
-    metrics["auc"] = ambient_predictions["auc"]
-    metrics["loss"] = ambient_predictions["loss"]
+    metrics["auc"] = combined_eval["auc"]
+    metrics["loss"] = combined_eval["loss"]
+    metrics["accuracy"] = combined_eval["accuracy"]
+    metrics["recall"] = combined_eval["recall"]
+    metrics["precision"] = combined_eval["precision"]
 
     recall_at_cutoffs = all_true_positives / (all_true_positives + all_false_negatives)
     faph_at_cutoffs = ambient_false_positives / duration_of_ambient_set
