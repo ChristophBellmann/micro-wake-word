@@ -16,11 +16,13 @@
 
 import argparse
 import os
+import random
 import sys
 import yaml
 import platform
 from absl import logging
 
+import numpy as np
 import tensorflow as tf
 
 # Disable GPU by default on ARM Macs, it's slower than just using the CPU
@@ -40,6 +42,34 @@ import microwakeword.inception as inception
 import microwakeword.mixednet as mixednet
 
 from microwakeword.layers import modes
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def configure_reproducibility(seed: int, deterministic_ops: bool):
+    """Configures process-global reproducibility knobs."""
+    if seed >= 0:
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        tf.keras.utils.set_random_seed(seed)
+        logging.info("Using global random seed: %d", seed)
+
+    if deterministic_ops:
+        os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+        try:
+            tf.config.experimental.enable_op_determinism()
+            logging.info("Enabled TensorFlow deterministic ops")
+        except Exception as exc:
+            logging.warning("Could not enable deterministic ops: %s", exc)
 
 
 def load_config(flags, model_module):
@@ -372,6 +402,18 @@ if __name__ == "__main__":
         default=logging.INFO,
         help='Log verbosity. Can be "INFO", "DEBUG", "ERROR", "FATAL", or "WARN"',
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=_env_int("MICRO_TRAIN_SEED", -1),
+        help="Global random seed. Set -1 to disable explicit seeding.",
+    )
+    parser.add_argument(
+        "--deterministic_ops",
+        type=int,
+        default=_env_int("MICRO_TRAIN_DETERMINISTIC", 0),
+        help="If 1, request deterministic TensorFlow ops where supported.",
+    )
 
     # sub parser for model settings
     subparsers = parser.add_subparsers(dest="model_name", help="NN model name")
@@ -396,6 +438,7 @@ if __name__ == "__main__":
         raise ValueError("Unknown model type: {}".format(flags.model_name))
 
     logging.set_verbosity(flags.verbosity)
+    configure_reproducibility(flags.seed, bool(flags.deterministic_ops))
 
     config = load_config(flags, model_module)
 
