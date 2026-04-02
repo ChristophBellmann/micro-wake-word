@@ -286,8 +286,39 @@ def _iter_nonstreaming_eval_batches_for_providers(
     batch_size: int,
     max_samples: int = 0,
 ):
-    batch_x = []
-    batch_y = []
+    batch_x = np.empty((batch_size, *feature_shape), dtype=np.float32)
+    batch_y = np.empty((batch_size, 1), dtype=np.float32)
+    batch_fill = 0
+
+    def flush_batch():
+        nonlocal batch_fill
+        if batch_fill <= 0:
+            return None
+        out_x = np.array(batch_x[:batch_fill], dtype=np.float32, copy=True)
+        out_y = np.array(batch_y[:batch_fill], dtype=np.float32, copy=True)
+        batch_fill = 0
+        return out_x, out_y
+
+    def append_sample(provider, spectrogram):
+        nonlocal batch_fill
+        spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
+        if spectrogram_np.shape != feature_shape:
+            spectrogram_np = np.asarray(
+                data_lib.fixed_length_spectrogram(
+                    spectrogram_np,
+                    features_length,
+                    truncation_strategy,
+                    0,
+                ),
+                dtype=np.float32,
+            )
+        batch_x[batch_fill] = spectrogram_np
+        batch_y[batch_fill, 0] = float(provider.label)
+        batch_fill += 1
+        if batch_fill == batch_size:
+            return flush_batch()
+        return None
+
     if max_samples > 0:
         providers = list(selected_providers)
         random.shuffle(providers)
@@ -312,27 +343,10 @@ def _iter_nonstreaming_eval_batches_for_providers(
                     spectrogram = next(generator)
                 except StopIteration:
                     continue
-                spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
-                if spectrogram_np.shape != feature_shape:
-                    spectrogram_np = np.asarray(
-                        data_lib.fixed_length_spectrogram(
-                            spectrogram_np,
-                            features_length,
-                            truncation_strategy,
-                            0,
-                        ),
-                        dtype=np.float32,
-                    )
-                batch_x.append(np.array(spectrogram_np, dtype=np.float32, copy=True))
-                batch_y.append(float(provider.label))
+                maybe_batch = append_sample(provider, spectrogram)
                 emitted += 1
-                if len(batch_x) == batch_size:
-                    yield (
-                        np.stack(batch_x, axis=0),
-                        np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
-                    )
-                    batch_x = []
-                    batch_y = []
+                if maybe_batch is not None:
+                    yield maybe_batch
                 if emitted >= max_samples:
                     break
                 next_iterators.append((provider, generator))
@@ -345,32 +359,13 @@ def _iter_nonstreaming_eval_batches_for_providers(
                 truncation_strategy=truncation_strategy,
             )
             for spectrogram in generator:
-                spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
-                if spectrogram_np.shape != feature_shape:
-                    spectrogram_np = np.asarray(
-                        data_lib.fixed_length_spectrogram(
-                            spectrogram_np,
-                            features_length,
-                            truncation_strategy,
-                            0,
-                        ),
-                        dtype=np.float32,
-                    )
-                batch_x.append(np.array(spectrogram_np, dtype=np.float32, copy=True))
-                batch_y.append(float(provider.label))
-                if len(batch_x) == batch_size:
-                    yield (
-                        np.stack(batch_x, axis=0),
-                        np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
-                    )
-                    batch_x = []
-                    batch_y = []
+                maybe_batch = append_sample(provider, spectrogram)
+                if maybe_batch is not None:
+                    yield maybe_batch
 
-    if batch_x:
-        yield (
-            np.stack(batch_x, axis=0),
-            np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
-        )
+    tail_batch = flush_batch()
+    if tail_batch is not None:
+        yield tail_batch
 
 
 def _nonstreaming_eval_worker_loop(
