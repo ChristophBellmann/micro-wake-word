@@ -432,6 +432,12 @@ def iter_nonstreaming_eval_batches(
         default_workers,
         minimum=0,
     )
+    min_providers_for_mp = env_int(
+        "MICRO_TRAIN_VALIDATION_MIN_PROVIDERS_FOR_MP",
+        5,
+        minimum=1,
+    )
+    force_validation_mp = env_bool("MICRO_TRAIN_VALIDATION_FORCE_MP", False)
     if max_samples > 0:
         eval_workers = min(eval_workers, max_samples)
     if eval_workers <= 1 or len(providers) <= 1:
@@ -441,6 +447,24 @@ def iter_nonstreaming_eval_batches(
                 eval_workers,
                 data_set,
             )
+        for batch in _iter_nonstreaming_eval_batches_for_providers(
+            providers,
+            data_set=data_set,
+            feature_shape=feature_shape,
+            features_length=features_length,
+            truncation_strategy=truncation_strategy,
+            batch_size=batch_size,
+            max_samples=max_samples,
+        ):
+            yield batch
+        return
+    if not force_validation_mp and len(providers) < min_providers_for_mp:
+        logging.info(
+            "Validation multiprocessing skipped: providers=%d dataset=%s threshold=%d",
+            len(providers),
+            data_set,
+            min_providers_for_mp,
+        )
         for batch in _iter_nonstreaming_eval_batches_for_providers(
             providers,
             data_set=data_set,
