@@ -177,18 +177,37 @@ class MmapFeatureGenerator(object):
             "validation_ambient",
         ]
 
+        def collect_mmap_dirs(split_root: Path) -> list[Path]:
+            if not split_root.is_dir():
+                return []
+
+            mmap_dirs = []
+            seen = set()
+
+            if (split_root / "data.ninja").is_file():
+                resolved = split_root.resolve()
+                seen.add(str(resolved))
+                mmap_dirs.append(resolved)
+
+            for candidate in sorted(split_root.glob("**/*_mmap/")):
+                resolved = candidate.resolve()
+                key = str(resolved)
+                if key in seen:
+                    continue
+                seen.add(key)
+                mmap_dirs.append(resolved)
+
+            return mmap_dirs
+
         for set_index in dirs:
             duration = 0.0
             count = 0
 
-            search_path_directory = os.path.join(path, set_index)
-            search_path = [
-                str(i)
-                for i in Path(os.path.abspath(search_path_directory)).glob("**/*_mmap/")
-            ]
+            search_path_directory = Path(os.path.abspath(os.path.join(path, set_index)))
+            search_path = collect_mmap_dirs(search_path_directory)
 
             for mmap_path in search_path:
-                imported_features = RaggedMmap(mmap_path)
+                imported_features = RaggedMmap(str(mmap_path))
 
                 self.loaded_features.append(imported_features)
                 feature_index = len(self.loaded_features) - 1
