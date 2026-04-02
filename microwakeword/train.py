@@ -240,6 +240,129 @@ def full_validation_is_better(
     )
 
 
+def _iter_nonstreaming_eval_batches_for_providers(
+    selected_providers,
+    data_set: str,
+    feature_shape,
+    features_length: int,
+    truncation_strategy: str,
+    batch_size: int,
+    max_samples: int = 0,
+):
+    batch_x = []
+    batch_y = []
+    if max_samples > 0:
+        providers = list(selected_providers)
+        random.shuffle(providers)
+        iterators = [
+            (
+                provider,
+                iter(
+                    provider.get_feature_generator(
+                        data_set,
+                        features_length=features_length,
+                        truncation_strategy=truncation_strategy,
+                    )
+                ),
+            )
+            for provider in providers
+        ]
+        emitted = 0
+        while iterators and emitted < max_samples:
+            next_iterators = []
+            for provider, generator in iterators:
+                try:
+                    spectrogram = next(generator)
+                except StopIteration:
+                    continue
+                spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
+                if spectrogram_np.shape != feature_shape:
+                    spectrogram_np = np.asarray(
+                        data_lib.fixed_length_spectrogram(
+                            spectrogram_np,
+                            features_length,
+                            truncation_strategy,
+                            0,
+                        ),
+                        dtype=np.float32,
+                    )
+                batch_x.append(np.array(spectrogram_np, dtype=np.float32, copy=True))
+                batch_y.append(float(provider.label))
+                emitted += 1
+                if len(batch_x) == batch_size:
+                    yield (
+                        np.stack(batch_x, axis=0),
+                        np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
+                    )
+                    batch_x = []
+                    batch_y = []
+                if emitted >= max_samples:
+                    break
+                next_iterators.append((provider, generator))
+            iterators = next_iterators
+    else:
+        for provider in selected_providers:
+            generator = provider.get_feature_generator(
+                data_set,
+                features_length=features_length,
+                truncation_strategy=truncation_strategy,
+            )
+            for spectrogram in generator:
+                spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
+                if spectrogram_np.shape != feature_shape:
+                    spectrogram_np = np.asarray(
+                        data_lib.fixed_length_spectrogram(
+                            spectrogram_np,
+                            features_length,
+                            truncation_strategy,
+                            0,
+                        ),
+                        dtype=np.float32,
+                    )
+                batch_x.append(np.array(spectrogram_np, dtype=np.float32, copy=True))
+                batch_y.append(float(provider.label))
+                if len(batch_x) == batch_size:
+                    yield (
+                        np.stack(batch_x, axis=0),
+                        np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
+                    )
+                    batch_x = []
+                    batch_y = []
+
+    if batch_x:
+        yield (
+            np.stack(batch_x, axis=0),
+            np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
+        )
+
+
+def _nonstreaming_eval_worker_loop(
+    result_q,
+    provider_chunk,
+    data_set: str,
+    feature_shape,
+    features_length: int,
+    truncation_strategy: str,
+    batch_size: int,
+    max_samples: int,
+):
+    try:
+        for batch in _iter_nonstreaming_eval_batches_for_providers(
+            provider_chunk,
+            data_set=data_set,
+            feature_shape=feature_shape,
+            features_length=features_length,
+            truncation_strategy=truncation_strategy,
+            batch_size=batch_size,
+            max_samples=max_samples,
+        ):
+            result_q.put(batch)
+    except Exception as exc:
+        result_q.put(("__validation_worker_error__", repr(exc)))
+    finally:
+        result_q.put(None)
+
+
 def iter_nonstreaming_eval_batches(
     config,
     data_processor,
@@ -251,41 +374,14 @@ def iter_nonstreaming_eval_batches(
     feature_shape = tuple(config["training_input_shape"])
     features_length = int(config["spectrogram_length"])
     batch_size = nonstreaming_eval_batch_size()
+    providers = [
+        provider
+        for provider in data_processor.feature_providers
+        if provider.get_mode_size(data_set)
+    ]
 
-    def iter_samples():
-        if max_samples > 0:
-            providers = list(data_processor.feature_providers)
-            random.shuffle(providers)
-            iterators = [
-                (
-                    provider,
-                    iter(
-                        provider.get_feature_generator(
-                            data_set,
-                            features_length=features_length,
-                            truncation_strategy=truncation_strategy,
-                        )
-                    ),
-                )
-                for provider in providers
-            ]
-            emitted = 0
-            while iterators and emitted < max_samples:
-                next_iterators = []
-                for provider, generator in iterators:
-                    try:
-                        spectrogram = next(generator)
-                    except StopIteration:
-                        continue
-                    yield provider, spectrogram
-                    emitted += 1
-                    if emitted >= max_samples:
-                        break
-                    next_iterators.append((provider, generator))
-                iterators = next_iterators
-            return
-
-        for provider in data_processor.feature_providers:
+    def iter_samples_for_providers(selected_providers):
+        for provider in selected_providers:
             generator = provider.get_feature_generator(
                 data_set,
                 features_length=features_length,
@@ -294,35 +390,140 @@ def iter_nonstreaming_eval_batches(
             for spectrogram in generator:
                 yield provider, spectrogram
 
-    batch_x = []
-    batch_y = []
-    for provider, spectrogram in iter_samples():
-        spectrogram_np = np.asarray(spectrogram, dtype=np.float32)
-        if spectrogram_np.shape != feature_shape:
-            spectrogram_np = np.asarray(
-                data_lib.fixed_length_spectrogram(
-                    spectrogram_np,
+    default_workers = os.cpu_count() or 1
+    eval_workers = env_int(
+        "MICRO_TRAIN_VALIDATION_WORKERS",
+        default_workers,
+        minimum=0,
+    )
+    if max_samples > 0:
+        eval_workers = min(eval_workers, max_samples)
+    if eval_workers <= 1 or len(providers) <= 1:
+        if eval_workers <= 1:
+            logging.info(
+                "Validation multiprocessing disabled: workers=%d dataset=%s",
+                eval_workers,
+                data_set,
+            )
+        for batch in _iter_nonstreaming_eval_batches_for_providers(
+            providers,
+            data_set=data_set,
+            feature_shape=feature_shape,
+            features_length=features_length,
+            truncation_strategy=truncation_strategy,
+            batch_size=batch_size,
+            max_samples=max_samples,
+        ):
+            yield batch
+        return
+
+    queue_factor = env_int("MICRO_TRAIN_VALIDATION_QUEUE_FACTOR", 2, minimum=1)
+    start_method = os.environ.get(
+        "MICRO_TRAIN_VALIDATION_START_METHOD",
+        os.environ.get("MICRO_TRAIN_DATA_START_METHOD", "fork"),
+    ).strip().lower()
+    if start_method not in {"fork", "spawn", "forkserver"}:
+        logging.warning(
+            "Invalid MICRO_TRAIN_VALIDATION_START_METHOD=%r, falling back to 'fork'",
+            start_method,
+        )
+        start_method = "fork"
+
+    worker_count = max(1, min(eval_workers, len(providers)))
+    provider_chunks = [[] for _ in range(worker_count)]
+    chunk_sizes = [0 for _ in range(worker_count)]
+    for provider in sorted(
+        providers,
+        key=lambda current: int(current.get_mode_size(data_set)),
+        reverse=True,
+    ):
+        idx = min(range(worker_count), key=lambda current: chunk_sizes[current])
+        provider_chunks[idx].append(provider)
+        chunk_sizes[idx] += max(1, int(provider.get_mode_size(data_set)))
+    provider_chunks = [chunk for chunk in provider_chunks if chunk]
+    worker_count = len(provider_chunks)
+    worker_limits = [0 for _ in range(worker_count)]
+    if max_samples > 0 and worker_count > 0:
+        base_limit = max_samples // worker_count
+        remainder = max_samples % worker_count
+        worker_limits = [
+            base_limit + (1 if index < remainder else 0)
+            for index in range(worker_count)
+        ]
+        active = [
+            (chunk, limit)
+            for chunk, limit in zip(provider_chunks, worker_limits)
+            if limit > 0
+        ]
+        provider_chunks = [chunk for chunk, _ in active]
+        worker_limits = [limit for _, limit in active]
+        worker_count = len(provider_chunks)
+    if worker_count <= 1:
+        for batch in _iter_nonstreaming_eval_batches_for_providers(
+            providers,
+            data_set=data_set,
+            feature_shape=feature_shape,
+            features_length=features_length,
+            truncation_strategy=truncation_strategy,
+            batch_size=batch_size,
+            max_samples=max_samples,
+        ):
+            yield batch
+        return
+
+    queue_depth = max(worker_count * queue_factor, worker_count + 1)
+    ctx = mp.get_context(start_method)
+    result_q = ctx.Queue(maxsize=queue_depth)
+    workers = []
+    logging.info(
+        "Validation multiprocessing enabled: workers=%d dataset=%s start_method=%s queue_depth=%d",
+        worker_count,
+        data_set,
+        start_method,
+        queue_depth,
+    )
+    try:
+        for provider_chunk, worker_limit in zip(
+            provider_chunks,
+            worker_limits if max_samples > 0 else [0] * worker_count,
+        ):
+            proc = ctx.Process(
+                target=_nonstreaming_eval_worker_loop,
+                args=(
+                    result_q,
+                    provider_chunk,
+                    data_set,
+                    feature_shape,
                     features_length,
                     truncation_strategy,
-                    0,
+                    batch_size,
+                    worker_limit,
                 ),
-                dtype=np.float32,
+                daemon=True,
             )
-        batch_x.append(np.array(spectrogram_np, dtype=np.float32, copy=True))
-        batch_y.append(float(provider.label))
-        if len(batch_x) == batch_size:
-            yield (
-                np.stack(batch_x, axis=0),
-                np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
-            )
-            batch_x = []
-            batch_y = []
+            proc.start()
+            workers.append(proc)
 
-    if batch_x:
-        yield (
-            np.stack(batch_x, axis=0),
-            np.asarray(batch_y, dtype=np.float32).reshape(-1, 1),
-        )
+        finished_workers = 0
+        while finished_workers < worker_count:
+            batch = result_q.get()
+            if batch is None:
+                finished_workers += 1
+                continue
+            if (
+                isinstance(batch, tuple)
+                and len(batch) == 2
+                and isinstance(batch[0], str)
+                and batch[0] == "__validation_worker_error__"
+            ):
+                raise RuntimeError(f"Validation worker failed: {batch[1]}")
+            yield batch
+    finally:
+        for proc in workers:
+            proc.join(timeout=1.0)
+            if proc.is_alive():
+                proc.terminate()
+        result_q.close()
 
 
 def _compute_binary_metrics_from_outputs(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
