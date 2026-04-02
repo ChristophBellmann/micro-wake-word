@@ -41,16 +41,40 @@ def swap_attribute(obj, attr, temp_value):
         setattr(obj, attr, original_value)
 
 
-def nonstreaming_eval_batch_size() -> int:
-    value = os.environ.get("MICRO_NONSTREAMING_EVAL_BATCH_SIZE", "1024").strip()
+def _has_visible_gpu() -> bool:
     try:
-        return max(1, int(value))
+        return bool(tf.config.list_logical_devices("GPU"))
+    except Exception:
+        return False
+
+
+def nonstreaming_eval_batch_size(config=None) -> int:
+    raw_value = os.environ.get("MICRO_NONSTREAMING_EVAL_BATCH_SIZE", "auto").strip()
+    value = raw_value.lower()
+    if value in {"", "auto"}:
+        train_batch_size = 0
+        if isinstance(config, dict):
+            try:
+                train_batch_size = max(0, int(config.get("batch_size", 0)))
+            except (TypeError, ValueError):
+                train_batch_size = 0
+        if _has_visible_gpu():
+            auto_cap = env_int(
+                "MICRO_NONSTREAMING_EVAL_BATCH_SIZE_AUTO_MAX",
+                32768,
+                minimum=1024,
+            )
+            auto_batch = max(4096, train_batch_size * 256 if train_batch_size > 0 else 16384)
+            return min(auto_batch, auto_cap)
+        return 1024
+    try:
+        return max(1, int(raw_value))
     except ValueError:
         logging.warning(
-            "Invalid MICRO_NONSTREAMING_EVAL_BATCH_SIZE=%r, falling back to 1024",
-            value,
+            "Invalid MICRO_NONSTREAMING_EVAL_BATCH_SIZE=%r, falling back to auto",
+            raw_value,
         )
-        return 1024
+        return nonstreaming_eval_batch_size(config)
 
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -373,7 +397,7 @@ def iter_nonstreaming_eval_batches(
     """Yield copied NumPy batches for nonstreaming eval without tf.data/from_generator."""
     feature_shape = tuple(config["training_input_shape"])
     features_length = int(config["spectrogram_length"])
-    batch_size = nonstreaming_eval_batch_size()
+    batch_size = nonstreaming_eval_batch_size(config)
     providers = [
         provider
         for provider in data_processor.feature_providers
