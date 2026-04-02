@@ -308,22 +308,21 @@ class MmapFeatureGenerator(object):
         """
         if truncation_strategy == "default":
             truncation_strategy = self.truncation_strategy
+        feature_set = self.feature_sets[mode]
+        loaded_features = self.loaded_features
+        split_step = max(1, int(1000 * self.step * self.stride))
+        scale_uint16 = 0.0390625
 
-        for feature in self.feature_sets[mode]:
-            spectrogram = self.loaded_features[feature["loaded_feature_index"]][
-                feature["subindex"]
-            ]
+        for feature in feature_set:
+            spectrogram = loaded_features[feature["loaded_feature_index"]][feature["subindex"]]
 
             # Spectrograms with type np.uint16 haven't been scaled
             if np.issubdtype(spectrogram.dtype, np.uint16):
-                spectrogram = spectrogram.astype(np.float32) * 0.0390625
+                spectrogram = spectrogram.astype(np.float32) * scale_uint16
 
             if truncation_strategy == "split":
-                for feature_start_index in range(
-                    0,
-                    spectrogram.shape[0] - features_length,
-                    int(1000 * self.step * self.stride),
-                ):  # 10*2 features corresponds to 200 ms
+                split_stop = spectrogram.shape[0] - features_length
+                for feature_start_index in range(0, split_stop, split_step):
                     split_spectrogram = spectrogram[
                         feature_start_index : feature_start_index + features_length
                     ]
