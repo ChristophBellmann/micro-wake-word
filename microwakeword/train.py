@@ -48,7 +48,11 @@ def _has_visible_gpu() -> bool:
         return False
 
 
-def nonstreaming_eval_batch_size(config=None) -> int:
+def nonstreaming_eval_batch_size(
+    config=None,
+    data_set: str = "",
+    truncation_strategy: str = "",
+) -> int:
     raw_value = os.environ.get("MICRO_NONSTREAMING_EVAL_BATCH_SIZE", "auto").strip()
     value = raw_value.lower()
     if value in {"", "auto"}:
@@ -61,10 +65,19 @@ def nonstreaming_eval_batch_size(config=None) -> int:
         if _has_visible_gpu():
             auto_cap = env_int(
                 "MICRO_NONSTREAMING_EVAL_BATCH_SIZE_AUTO_MAX",
-                32768,
+                65536,
                 minimum=1024,
             )
             auto_batch = max(4096, train_batch_size * 256 if train_batch_size > 0 else 16384)
+            if truncation_strategy == "split" or data_set.endswith("_ambient"):
+                auto_batch = max(
+                    auto_batch,
+                    env_int(
+                        "MICRO_NONSTREAMING_EVAL_SPLIT_BATCH_SIZE_AUTO",
+                        65536,
+                        minimum=4096,
+                    ),
+                )
             return min(auto_batch, auto_cap)
         return 1024
     try:
@@ -74,7 +87,7 @@ def nonstreaming_eval_batch_size(config=None) -> int:
             "Invalid MICRO_NONSTREAMING_EVAL_BATCH_SIZE=%r, falling back to auto",
             raw_value,
         )
-        return nonstreaming_eval_batch_size(config)
+        return nonstreaming_eval_batch_size(config, data_set=data_set, truncation_strategy=truncation_strategy)
 
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -397,7 +410,11 @@ def iter_nonstreaming_eval_batches(
     """Yield copied NumPy batches for nonstreaming eval without tf.data/from_generator."""
     feature_shape = tuple(config["training_input_shape"])
     features_length = int(config["spectrogram_length"])
-    batch_size = nonstreaming_eval_batch_size(config)
+    batch_size = nonstreaming_eval_batch_size(
+        config,
+        data_set=data_set,
+        truncation_strategy=truncation_strategy,
+    )
     providers = [
         provider
         for provider in data_processor.feature_providers
