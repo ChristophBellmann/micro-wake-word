@@ -207,12 +207,25 @@ class MmapFeatureGenerator(object):
             search_path = collect_mmap_dirs(search_path_directory)
 
             for mmap_path in search_path:
-                imported_features = RaggedMmap(str(mmap_path))
+                try:
+                    imported_features = RaggedMmap(str(mmap_path))
+                    imported_len = len(imported_features)
+                    if imported_len > 0:
+                        # Fail fast on malformed mmap containers so one bad root
+                        # cannot crash the whole training run.
+                        _ = imported_features[0]
+                except Exception as exc:
+                    logging.warning(
+                        "Skipping invalid mmap dataset: %s (%s)",
+                        str(mmap_path),
+                        exc,
+                    )
+                    continue
 
                 self.loaded_features.append(imported_features)
                 feature_index = len(self.loaded_features) - 1
 
-                for i in range(0, len(imported_features)):
+                for i in range(0, imported_len):
                     self.feature_sets[set_index].append(
                         {
                             "loaded_feature_index": feature_index,
@@ -393,7 +406,19 @@ class DistillationMmapFeatureGenerator(object):
                 continue
             mmap_key = str(mmap_path)
             if mmap_key not in loaded_feature_indices:
-                imported_features = RaggedMmap(str(mmap_path))
+                try:
+                    imported_features = RaggedMmap(str(mmap_path))
+                    imported_len = len(imported_features)
+                    if imported_len > 0:
+                        # Validate early to avoid runtime crashes from invalid roots.
+                        _ = imported_features[0]
+                except Exception as exc:
+                    logging.warning(
+                        "Skipping invalid distillation mmap dataset: %s (%s)",
+                        str(mmap_path),
+                        exc,
+                    )
+                    continue
                 self.loaded_features.append(imported_features)
                 loaded_feature_indices[mmap_key] = len(self.loaded_features) - 1
             feature_index = loaded_feature_indices[mmap_key]
