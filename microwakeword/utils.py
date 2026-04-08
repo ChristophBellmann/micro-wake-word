@@ -15,13 +15,47 @@
 # limitations under the License.
 
 """Utility functions for operations on Model."""
+import contextlib
+import io
+import os
 import os.path
+import sys
 import numpy as np
 import tensorflow as tf
 
 from absl import logging
 
 from microwakeword.layers import modes, stream, strided_drop
+
+
+def _minimal_logs_enabled() -> bool:
+    raw = os.environ.get("WAKEWORD_MINIMAL_LOGS", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+@contextlib.contextmanager
+def _suppress_stdio_if_minimal():
+    if not _minimal_logs_enabled():
+        yield
+        return
+    saved_fds = []
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        for stream in (sys.__stdout__, sys.__stderr__):
+            try:
+                fd = stream.fileno()
+            except (AttributeError, io.UnsupportedOperation):
+                continue
+            stream.flush()
+            saved_fds.append((fd, os.dup(fd)))
+            os.dup2(devnull_fd, fd)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            yield
+    finally:
+        for fd, saved_fd in reversed(saved_fds):
+            os.dup2(saved_fd, fd)
+            os.close(saved_fd)
+        os.close(devnull_fd)
 
 
 def _set_mode(model, mode):
@@ -344,7 +378,8 @@ def convert_saved_model_to_tflite(
         os.makedirs(folder)
 
     with open(os.path.join(folder, fname), "wb") as f:
-        tflite_model = converter.convert()
+        with _suppress_stdio_if_minimal():
+            tflite_model = converter.convert()
         f.write(tflite_model)
 
 
@@ -364,7 +399,8 @@ def convert_model_saved(model, config, folder, mode):
 
     # Convert trained model to SavedModel
     converted_model = model_to_saved(model, config, mode)
-    converted_model.summary()
+    with _suppress_stdio_if_minimal():
+        converted_model.summary()
 
     assert converted_model.input.shape[0] is not None
 
@@ -377,7 +413,8 @@ def convert_model_saved(model, config, folder, mode):
         fn=converted_model.call,
         input_signature=[tf.TensorSpec(shape=converted_model.input.shape, dtype=tf.float32)],
     )
-    export_archive.write_out(path_model)
+    with _suppress_stdio_if_minimal():
+        export_archive.write_out(path_model)
 
     save_model_summary(converted_model, path_model)
 

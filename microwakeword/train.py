@@ -29,6 +29,29 @@ import tensorflow as tf
 import microwakeword.data as data_lib
 
 
+_LOG_ONCE_KEYS = set()
+
+
+def _minimal_logs_enabled() -> bool:
+    raw = os.environ.get("WAKEWORD_MINIMAL_LOGS", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _log_verbose_info(message, *args):
+    if not _minimal_logs_enabled():
+        logging.info(message, *args)
+
+
+def _log_info_once(key, message, *args):
+    if not _minimal_logs_enabled():
+        logging.info(message, *args)
+        return
+    if key in _LOG_ONCE_KEYS:
+        return
+    _LOG_ONCE_KEYS.add(key)
+    logging.info(message, *args)
+
+
 @contextlib.contextmanager
 def swap_attribute(obj, attr, temp_value):
     """Temporarily swap an attribute of an object."""
@@ -442,7 +465,8 @@ def iter_nonstreaming_eval_batches(
         eval_workers = min(eval_workers, max_samples)
     if eval_workers <= 1 or len(providers) <= 1:
         if eval_workers <= 1:
-            logging.info(
+            _log_info_once(
+                f"validation-mp-disabled:{data_set}:{eval_workers}",
                 "Validation multiprocessing disabled: workers=%d dataset=%s",
                 eval_workers,
                 data_set,
@@ -459,7 +483,8 @@ def iter_nonstreaming_eval_batches(
             yield batch
         return
     if not force_validation_mp and len(providers) < min_providers_for_mp:
-        logging.info(
+        _log_info_once(
+            f"validation-mp-skipped:{data_set}:{len(providers)}:{min_providers_for_mp}",
             "Validation multiprocessing skipped: providers=%d dataset=%s threshold=%d",
             len(providers),
             data_set,
@@ -535,7 +560,8 @@ def iter_nonstreaming_eval_batches(
     ctx = mp.get_context(start_method)
     result_q = ctx.Queue(maxsize=queue_depth)
     workers = []
-    logging.info(
+    _log_info_once(
+        f"validation-mp-enabled:{data_set}:{worker_count}:{start_method}:{queue_depth}",
         "Validation multiprocessing enabled: workers=%d dataset=%s start_method=%s queue_depth=%d",
         worker_count,
         data_set,
@@ -773,7 +799,8 @@ def build_training_dataset(config, data_processor, policy_ref):
         request_q = ctx.Queue(maxsize=queue_depth)
         result_q = ctx.Queue(maxsize=queue_depth)
         workers = []
-        logging.info(
+        _log_info_once(
+            f"train-data-mp-enabled:{worker_count}:{start_method}:{queue_depth}",
             "Training tf.data multiprocessing enabled: workers=%d start_method=%s queue_depth=%d",
             worker_count,
             start_method,
@@ -815,7 +842,11 @@ def build_training_dataset(config, data_processor, policy_ref):
         ),
     )
     if data_workers <= 1:
-        logging.info("Training tf.data multiprocessing disabled: workers=%d", data_workers)
+        _log_info_once(
+            f"train-data-mp-disabled:{data_workers}",
+            "Training tf.data multiprocessing disabled: workers=%d",
+            data_workers,
+        )
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     dataset = apply_optional_device_prefetch(dataset)
     return dataset
@@ -929,7 +960,7 @@ def build_tfrecord_training_dataset(config, data_processor):
 
                 written += current_batch
                 if written % 5000 == 0 or written == record_count:
-                    logging.info(
+                    _log_verbose_info(
                         "TFRecord cache progress: %d/%d examples",
                         written,
                         record_count,
@@ -950,7 +981,11 @@ def build_tfrecord_training_dataset(config, data_processor):
                 indent=2,
             )
     else:
-        logging.info("Reusing TFRecord training cache: %s", tfrecord_path)
+        _log_info_once(
+            f"tfrecord-cache-reuse:{tfrecord_path}",
+            "Reusing TFRecord training cache: %s",
+            tfrecord_path,
+        )
 
     flat_size = int(np.prod(feature_shape))
     feature_spec = {
@@ -998,7 +1033,8 @@ def build_tfrecord_training_dataset(config, data_processor):
     dataset = dataset.batch(batch_size, drop_remainder=True)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     dataset = apply_optional_device_prefetch(dataset)
-    logging.info(
+    _log_info_once(
+        f"tfrecord-pipeline:{record_count}:{batch_size}:{shuffle_buffer}:{chosen_cache_mode}",
         "Training TFRecord pipeline enabled: records=%d, batch=%d, shuffle_buffer=%d, cache=%s",
         record_count,
         batch_size,
@@ -1006,7 +1042,7 @@ def build_tfrecord_training_dataset(config, data_processor):
         chosen_cache_mode,
     )
     if cache_mode == "auto":
-        logging.info(
+        _log_verbose_info(
             "TFRecord cache auto decision: estimated=%.1fMB threshold=%dMB",
             estimated_bytes / (1024.0 * 1024.0),
             cache_ram_mb,
@@ -1288,6 +1324,25 @@ def validate_nonstreaming_with_policy(config, data_processor, model, test_set, m
 
 def format_nonstreaming_validation_log(training_step, nonstreaming_metrics):
     validation_mode = nonstreaming_metrics["validation_mode"]
+    if _minimal_logs_enabled():
+        prefix = (
+            f"Step {training_step} (val/{validation_mode}): "
+            f"acc={nonstreaming_metrics['accuracy'] * 100:.2f}% "
+            f"rec={nonstreaming_metrics['recall'] * 100:.2f}% "
+            f"prec={nonstreaming_metrics['precision'] * 100:.2f}% "
+            f"loss={nonstreaming_metrics['loss']:.5f} "
+            f"auc={nonstreaming_metrics['auc']:.5f}"
+        )
+        if not nonstreaming_metrics.get("ambient_metrics_available", False):
+            return prefix
+        ambient_cutoff = nonstreaming_metrics.get("ambient_reporting_cutoff", 0.5)
+        return (
+            prefix
+            + f" no_faph_rec={nonstreaming_metrics['recall_at_no_faph'] * 100:.3f}%"
+            + f" cutoff={nonstreaming_metrics['cutoff_for_no_faph']:.2f}"
+            + f" faph@{ambient_cutoff:.2f}={nonstreaming_metrics['ambient_false_positives_per_hour']:.5f}"
+            + f" avr={nonstreaming_metrics['average_viable_recall']:.6f}"
+        )
     prefix = (
         f"Step {training_step} (nonstreaming/{validation_mode}): Validation: "
         f"accuracy = {nonstreaming_metrics['accuracy'] * 100:.2f}%, "
@@ -1636,51 +1691,76 @@ def train(model, config, data_processor):
             train_distill_loss = float(train_result["distill_loss"])
             train_total_loss = float(train_result["total_loss"])
             distillation_active = bool(train_result["distillation_active"])
-            print(
-                "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
-                    (training_step // config["eval_step_interval"] + 1),
-                    train_accuracy,
-                    train_recall,
-                    train_precision,
-                    train_total_loss,
-                    (training_step % config["eval_step_interval"]),
-                ),
-                end="\r",
-            )
+            if not _minimal_logs_enabled():
+                print(
+                    "Validation Batch #{:d}: Accuracy = {:.3f}; Recall = {:.3f}; Precision = {:.3f}; Loss = {:.4f}; Mini-Batch #{:d}".format(
+                        (training_step // config["eval_step_interval"] + 1),
+                        train_accuracy,
+                        train_recall,
+                        train_precision,
+                        train_total_loss,
+                        (training_step % config["eval_step_interval"]),
+                    ),
+                    end="\r",
+                )
 
         if eval_due:
             progress_pct = (training_step / training_steps_max) * 100.0
             current_eval_batch = int(np.ceil(training_step / config["eval_step_interval"]))
             total_eval_batches = int(np.ceil(training_steps_max / config["eval_step_interval"]))
-            logging.info(
-                "Step #%d: rate %f, accuracy %.2f%%, recall %.2f%%, precision %.2f%%, cross entropy %f",
-                *(
-                    training_step,
-                    learning_rate,
-                    train_accuracy * 100,
-                    train_recall * 100,
-                    train_precision * 100,
-                    train_total_loss,
-                ),
-            )
-            if distillation_active:
-                logging.info(
-                    "Step #%d (distill): hard_loss=%f distill_loss=%f alpha=%f beta=%f temperature=%f",
-                    training_step,
-                    train_hard_loss,
-                    train_distill_loss,
-                    distillation_alpha,
-                    distillation_beta,
-                    distillation_temperature,
+            if _minimal_logs_enabled():
+                step_summary = (
+                    f"Step #{training_step}: lr={learning_rate:.6f} "
+                    f"acc={train_accuracy * 100:.2f}% "
+                    f"rec={train_recall * 100:.2f}% "
+                    f"prec={train_precision * 100:.2f}% "
+                    f"loss={train_total_loss:.6f}"
                 )
-            logging.info(
-                "Progress: %.1f%% (%d/%d steps, eval batch %d/%d)",
-                progress_pct,
-                training_step,
-                training_steps_max,
-                current_eval_batch,
-                total_eval_batches,
-            )
+                if distillation_active:
+                    step_summary += (
+                        f" hard={train_hard_loss:.6f}"
+                        f" distill={train_distill_loss:.6f}"
+                        f" a={distillation_alpha:.3f}"
+                        f" b={distillation_beta:.3f}"
+                        f" T={distillation_temperature:.3f}"
+                    )
+                step_summary += (
+                    f" progress={progress_pct:.1f}%"
+                    f" eval={current_eval_batch}/{total_eval_batches}"
+                )
+                if np.isfinite(train_auc):
+                    step_summary += f" auc={train_auc:.5f}"
+                logging.info(step_summary)
+            else:
+                logging.info(
+                    "Step #%d: rate %f, accuracy %.2f%%, recall %.2f%%, precision %.2f%%, cross entropy %f",
+                    *(
+                        training_step,
+                        learning_rate,
+                        train_accuracy * 100,
+                        train_recall * 100,
+                        train_precision * 100,
+                        train_total_loss,
+                    ),
+                )
+                if distillation_active:
+                    logging.info(
+                        "Step #%d (distill): hard_loss=%f distill_loss=%f alpha=%f beta=%f temperature=%f",
+                        training_step,
+                        train_hard_loss,
+                        train_distill_loss,
+                        distillation_alpha,
+                        distillation_beta,
+                        distillation_temperature,
+                    )
+                logging.info(
+                    "Progress: %.1f%% (%d/%d steps, eval batch %d/%d)",
+                    progress_pct,
+                    training_step,
+                    training_steps_max,
+                    current_eval_batch,
+                    total_eval_batches,
+                )
 
             with train_writer.as_default():
                 tf.summary.scalar("loss", train_total_loss, step=training_step)
@@ -1784,6 +1864,12 @@ def train(model, config, data_processor):
                     best_minimization_quantity = current_minimization_quantity
                     best_maximization_quantity = current_maximization_quantity
                     best_no_faph_cutoff = current_no_faph_cutoff
+                    logging.info(
+                        "Full validation improved: best_min=%.3f best_max=%.5f%% no_faph_cutoff=%.2f",
+                        best_minimization_quantity,
+                        (best_maximization_quantity * 100),
+                        best_no_faph_cutoff,
+                    )
                     full_validation_no_improve_count = 0
                     full_validation_no_improve_since_lr_drop = 0
 
@@ -1836,12 +1922,20 @@ def train(model, config, data_processor):
                             full_validation_no_improve_count,
                         )
 
-            logging.info(
-                "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
-                best_minimization_quantity,
-                (best_maximization_quantity * 100),
-                best_no_faph_cutoff,
-            )
+            if not _minimal_logs_enabled():
+                logging.info(
+                    "So far the best minimization quantity is %.3f with best maximization quantity of %.5f%%; no faph cutoff is %.2f",
+                    best_minimization_quantity,
+                    (best_maximization_quantity * 100),
+                    best_no_faph_cutoff,
+                )
+            elif nonstreaming_metrics["is_full_validation"] and not full_validation_improved:
+                logging.info(
+                    "Full validation best remains: best_min=%.3f best_max=%.5f%% no_faph_cutoff=%.2f",
+                    best_minimization_quantity,
+                    (best_maximization_quantity * 100),
+                    best_no_faph_cutoff,
+                )
 
             if stop_requested:
                 break

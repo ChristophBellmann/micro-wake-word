@@ -15,6 +15,8 @@
 # limitations under the License.
 
 import argparse
+import contextlib
+import io
 import os
 import random
 import sys
@@ -42,6 +44,103 @@ import microwakeword.inception as inception
 import microwakeword.mixednet as mixednet
 
 from microwakeword.layers import modes
+
+_MINIMAL_LOG_ROUTING_INSTALLED = False
+_SUPPRESSED_MINIMAL_INFO_PREFIXES = (
+    "Sharding callback duration:",
+)
+_SUPPRESSED_MINIMAL_WARNINGS = (
+    "ring_buffer_size_in_time_dim overwritten by the passed-in value",
+    "Function `call` contains input name(s) resource with unsupported characters",
+)
+
+
+def _minimal_logs_enabled() -> bool:
+    raw = os.environ.get("WAKEWORD_MINIMAL_LOGS", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _format_log_message(message, *args) -> str:
+    text = str(message)
+    if not args:
+        return text
+    try:
+        return text % args
+    except Exception:
+        return " ".join([text, *[str(arg) for arg in args]])
+
+
+def _emit_plain(prefix: str, message: str) -> None:
+    print(f"{prefix}{message}", flush=True)
+
+
+@contextlib.contextmanager
+def _suppress_stdio_if_minimal():
+    if not _minimal_logs_enabled():
+        yield
+        return
+    saved_fds = []
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        for stream in (sys.__stdout__, sys.__stderr__):
+            try:
+                fd = stream.fileno()
+            except (AttributeError, io.UnsupportedOperation):
+                continue
+            stream.flush()
+            saved_fds.append((fd, os.dup(fd)))
+            os.dup2(devnull_fd, fd)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            yield
+    finally:
+        for fd, saved_fd in reversed(saved_fds):
+            os.dup2(saved_fd, fd)
+            os.close(saved_fd)
+        os.close(devnull_fd)
+
+
+def _install_minimal_log_routing() -> None:
+    global _MINIMAL_LOG_ROUTING_INSTALLED
+    if _MINIMAL_LOG_ROUTING_INSTALLED or not _minimal_logs_enabled():
+        return
+
+    def _info(message, *args, **kwargs):
+        del kwargs
+        text = _format_log_message(message, *args)
+        if any(text.startswith(prefix) for prefix in _SUPPRESSED_MINIMAL_INFO_PREFIXES):
+            return
+        _emit_plain("", text)
+
+    def _warning(message, *args, **kwargs):
+        del kwargs
+        text = _format_log_message(message, *args)
+        if any(pattern in text for pattern in _SUPPRESSED_MINIMAL_WARNINGS):
+            return
+        _emit_plain("WARNING: ", text)
+
+    def _error(message, *args, **kwargs):
+        del kwargs
+        _emit_plain("ERROR: ", _format_log_message(message, *args))
+
+    logging.info = _info
+    logging.warning = _warning
+    logging.error = _error
+    _MINIMAL_LOG_ROUTING_INSTALLED = True
+
+
+def _log_model_summary(model, label: str) -> None:
+    if _minimal_logs_enabled():
+        logging.info(
+            "%s: params=%d trainable=%d non_trainable=%d input_shape=%s output_shape=%s",
+            label,
+            int(model.count_params()),
+            len(model.trainable_weights),
+            len(model.non_trainable_weights),
+            model.input_shape,
+            model.output_shape,
+        )
+        return
+    model.summary(print_fn=lambda line: logging.info(line))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -438,6 +537,7 @@ if __name__ == "__main__":
         raise ValueError("Unknown model type: {}".format(flags.model_name))
 
     logging.set_verbosity(flags.verbosity)
+    _install_minimal_log_routing()
     configure_reproducibility(flags.seed, bool(flags.deterministic_ops))
 
     config = load_config(flags, model_module)
@@ -445,10 +545,11 @@ if __name__ == "__main__":
     data_processor = input_data.FeatureHandler(config)
 
     if flags.train:
-        model = model_module.model(
-            flags, config["training_input_shape"], config["batch_size"]
-        )
-        logging.info(model.summary())
+        with _suppress_stdio_if_minimal():
+            model = model_module.model(
+                flags, config["training_input_shape"], config["batch_size"]
+            )
+        _log_model_summary(model, "Training model")
         train_model(config, model, data_processor, flags.restore_checkpoint)
     else:
         if not os.path.isdir(config["train_dir"]):
@@ -460,15 +561,16 @@ if __name__ == "__main__":
         or flags.test_tflite_streaming
         or flags.test_tflite_streaming_quantized
     ):
-        model = model_module.model(
-            flags, shape=config["training_input_shape"], batch_size=1
-        )
+        with _suppress_stdio_if_minimal():
+            model = model_module.model(
+                flags, shape=config["training_input_shape"], batch_size=1
+            )
 
         model.load_weights(
             os.path.join(config["train_dir"], flags.use_weights) + ".weights.h5"
         )
 
-        logging.info(model.summary())
+        _log_model_summary(model, "Evaluation model")
 
         evaluate_model(
             config,

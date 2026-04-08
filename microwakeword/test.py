@@ -16,7 +16,10 @@
 
 """Test utility functions for accuracy evaluation."""
 
+import contextlib
+import io
 import os
+import sys
 
 import numpy as np
 import tensorflow as tf
@@ -25,6 +28,41 @@ from absl import logging
 from typing import List
 from microwakeword.inference import Model
 from numpy.lib.stride_tricks import sliding_window_view
+
+
+def _minimal_logs_enabled() -> bool:
+    raw = os.environ.get("WAKEWORD_MINIMAL_LOGS", "0").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _log_verbose_info(message, *args):
+    if not _minimal_logs_enabled():
+        logging.info(message, *args)
+
+
+@contextlib.contextmanager
+def _suppress_stdio_if_minimal():
+    if not _minimal_logs_enabled():
+        yield
+        return
+    saved_fds = []
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        for stream in (sys.__stdout__, sys.__stderr__):
+            try:
+                fd = stream.fileno()
+            except (AttributeError, io.UnsupportedOperation):
+                continue
+            stream.flush()
+            saved_fds.append((fd, os.dup(fd)))
+            os.dup2(devnull_fd, fd)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            yield
+    finally:
+        for fd, saved_fd in reversed(saved_fds):
+            os.dup2(saved_fd, fd)
+            os.close(saved_fd)
+        os.close(devnull_fd)
 
 
 def compute_metrics(true_positives, true_negatives, false_positives, false_negatives):
@@ -265,7 +303,7 @@ def tf_model_accuracy(
             )
 
             if i % 1000 == 0 and i:
-                logging.info(
+                _log_verbose_info(
                     "TensorFlow model on the {dataset} set: accuracy = {accuracy:.6}; recall = {recall:.6}; precision = {precision:.6}; fpr = {fpr:.6}; fnr = {fnr:.6} ({iteration} out of {length})".format(
                         dataset=data_set,
                         accuracy=metrics["accuracy"],
@@ -319,9 +357,10 @@ def tflite_streaming_model_roc(
         float: The Area under the false accept per hour vs. false rejection curve.
     """
     stride = config["stride"]
-    model = Model(
-        os.path.join(config["train_dir"], folder, tflite_model_name), stride=stride
-    )
+    with _suppress_stdio_if_minimal():
+        model = Model(
+            os.path.join(config["train_dir"], folder, tflite_model_name), stride=stride
+        )
 
     test_ambient_fingerprints, _, _, _ = audio_processor.get_data(
         ambient_set,
@@ -330,7 +369,7 @@ def tflite_streaming_model_roc(
         truncation_strategy="none",
     )
 
-    logging.info("Testing the " + ambient_set + " set.")
+    _log_verbose_info("Testing the %s set.", ambient_set)
     ambient_streaming_probabilities = []
     for spectrogram_track in test_ambient_fingerprints:
         streaming_probabilities = model.predict_spectrogram(spectrogram_track)
@@ -358,7 +397,7 @@ def tflite_streaming_model_roc(
         truncation_strategy="none",
     )
 
-    logging.info("Testing the " + data_set + " set.")
+    _log_verbose_info("Testing the %s set.", data_set)
 
     positive_sample_streaming_probabilities = []
     for i in range(len(test_fingerprints)):
@@ -390,14 +429,14 @@ def tflite_streaming_model_roc(
     with open(os.path.join(path, accuracy_name), "wt") as fd:
         auc = np.trapz(y_coordinates, x_coordinates)
         auc_string = "AUC {:.5f}".format(auc)
-        logging.info(auc_string)
+        _log_verbose_info(auc_string)
         fd.write(auc_string + "\n")
 
         for i in range(0, x_coordinates.shape[0]):
             cutoff_string = "Cutoff {:.2f}: frr={:.4f}; faph={:.3f}".format(
                 cutoffs_at_points[i], y_coordinates[i], x_coordinates[i]
             )
-            logging.info(cutoff_string)
+            _log_verbose_info(cutoff_string)
             fd.write(cutoff_string + "\n")
 
     return auc
@@ -431,7 +470,8 @@ def tflite_model_accuracy(
         Metric dictionary with keys for `accuracy`, `recall`, `precision`, `false_positive_rate`, `false_negative_rate`, and `count`
     """
 
-    model = Model(os.path.join(config["train_dir"], folder, tflite_model_name))
+    with _suppress_stdio_if_minimal():
+        model = Model(os.path.join(config["train_dir"], folder, tflite_model_name))
 
     truncation_strategy = "truncate_start"
     if data_set.endswith("ambient"):
@@ -444,7 +484,7 @@ def tflite_model_accuracy(
         truncation_strategy=truncation_strategy,
     )
 
-    logging.info("Testing TFLite model on the {data_set} set".format(data_set=data_set))
+    _log_verbose_info("Testing TFLite model on the %s set", data_set)
 
     true_positives = 0.0
     true_negatives = 0.0
@@ -488,7 +528,7 @@ def tflite_model_accuracy(
         )
 
         if i % 1000 == 0 and i:
-            logging.info(
+            _log_verbose_info(
                 "TFLite model on the {dataset} set: accuracy = {accuracy:.6}; recall = {recall:.6}; precision = {precision:.6}; fpr = {fpr:.6}; fnr = {fnr:.6} ({iteration} out of {length})".format(
                     dataset=data_set,
                     accuracy=metrics["accuracy"],
@@ -510,7 +550,7 @@ def tflite_model_accuracy(
             / (audio_processor.get_mode_duration(data_set) / 3600.0),
         )
 
-    logging.info("Final TFLite model on the " + data_set + " set: " + metrics_string)
+    _log_verbose_info("Final TFLite model on the %s set: %s", data_set, metrics_string)
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
         fd.write(metrics_string)
