@@ -58,6 +58,32 @@ def _suppress_stdio_if_minimal():
         os.close(devnull_fd)
 
 
+@contextlib.contextmanager
+def _workaround_dictwrapper_tf_type_bug():
+    """Avoid a TF 2.20/Python 3.12 SavedModel export crash on _DictWrapper."""
+    try:
+        from tensorflow.python.framework import tensor_util  # pylint: disable=g-direct-tensorflow-import
+    except Exception:
+        yield
+        return
+
+    original_is_tf_type = tensor_util.is_tf_type
+
+    def safe_is_tf_type(obj):
+        try:
+            return original_is_tf_type(obj)
+        except TypeError as exc:
+            if "_DictWrapper" in str(exc):
+                return False
+            raise
+
+    tensor_util.is_tf_type = safe_is_tf_type
+    try:
+        yield
+    finally:
+        tensor_util.is_tf_type = original_is_tf_type
+
+
 def _set_mode(model, mode):
     """Set model's inference type and disable training."""
 
@@ -405,15 +431,19 @@ def convert_model_saved(model, config, folder, mode):
     assert converted_model.input.shape[0] is not None
 
     # XXX: Using `converted_model.export(path_model)` results in obscure errors during
-    # quantization, we create an export archive directly instead.
+    # quantization, we create an export archive directly instead. TF 2.20 on
+    # Python 3.12 can trip over _DictWrapper children while exporting; the scoped
+    # workaround keeps the SavedModel path intact for streaming resource variables.
     export_archive = tf.keras.export.ExportArchive()
     export_archive.track(converted_model)
     export_archive.add_endpoint(
         name="serve",
         fn=converted_model.call,
-        input_signature=[tf.TensorSpec(shape=converted_model.input.shape, dtype=tf.float32)],
+        input_signature=[
+            tf.TensorSpec(shape=converted_model.input.shape, dtype=tf.float32)
+        ],
     )
-    with _suppress_stdio_if_minimal():
+    with _workaround_dictwrapper_tf_type_bug(), _suppress_stdio_if_minimal():
         export_archive.write_out(path_model)
 
     save_model_summary(converted_model, path_model)
