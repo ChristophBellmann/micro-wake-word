@@ -427,7 +427,7 @@ def tflite_streaming_model_roc(
 
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
-        auc = np.trapz(y_coordinates, x_coordinates)
+        auc = np.trapezoid(y_coordinates, x_coordinates)
         auc_string = "AUC {:.5f}".format(auc)
         _log_verbose_info(auc_string)
         fd.write(auc_string + "\n")
