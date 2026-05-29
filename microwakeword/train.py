@@ -252,6 +252,68 @@ def make_streaming_eval_dataset(
     return dataset.prefetch(tf.data.AUTOTUNE)
 
 
+def make_tfdata_eval_dataset(config, data_processor, data_set, truncation_strategy, max_samples=0):
+    """Build a tf.data dataset for evaluation, filtering providers by mode size.
+    
+    An alternative to iter_nonstreaming_eval_batches that uses tf.data pipelines
+    instead of Python multiprocessing + manual NumPy batching.
+    """
+    feature_shape = tuple(config["training_input_shape"])
+    providers = [
+        p for p in data_processor.feature_providers
+        if p.get_mode_size(data_set)
+    ]
+    if not providers:
+        return tf.data.Dataset.from_tensor_slices(
+            (tf.zeros((0, *feature_shape), dtype=tf.float32),
+             tf.zeros((0, 1), dtype=tf.float32))
+        )
+
+    def sample_generator():
+        if max_samples > 0:
+            random.shuffle(providers)
+            iterators = [
+                (p, iter(p.get_feature_generator(data_set,
+                    features_length=config["spectrogram_length"],
+                    truncation_strategy=truncation_strategy)))
+                for p in providers
+            ]
+            emitted = 0
+            while iterators and emitted < max_samples:
+                next_iters = []
+                for p, gen in iterators:
+                    try:
+                        spec = next(gen)
+                    except StopIteration:
+                        continue
+                    yield (np.asarray(spec, dtype=np.float32),
+                           np.asarray([p.label], dtype=np.float32))
+                    emitted += 1
+                    if emitted >= max_samples:
+                        break
+                    next_iters.append((p, gen))
+                iterators = next_iters
+        else:
+            for p in providers:
+                gen = p.get_feature_generator(data_set,
+                    features_length=config["spectrogram_length"],
+                    truncation_strategy=truncation_strategy)
+                for spec in gen:
+                    yield (np.asarray(spec, dtype=np.float32),
+                           np.asarray([p.label], dtype=np.float32))
+
+    dataset = tf.data.Dataset.from_generator(
+        sample_generator,
+        output_signature=(
+            tf.TensorSpec(shape=feature_shape, dtype=tf.float32),
+            tf.TensorSpec(shape=(1,), dtype=tf.float32),
+        ),
+    )
+    dataset = dataset.batch(nonstreaming_eval_batch_size())
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    return dataset
+
+
 def eval_steps_for_mode(data_processor, data_set: str, max_samples: int = 0) -> int:
     """Compute deterministic evaluate() steps for finite datasets."""
     total_samples = int(data_processor.get_mode_size(data_set))
@@ -690,16 +752,28 @@ def run_nonstreaming_numpy_eval(
 
     all_truth = []
     all_pred = []
-    for batch_x, batch_y in iter_nonstreaming_eval_batches(
-        config,
-        data_processor,
-        data_set,
-        truncation_strategy=truncation_strategy,
-        max_samples=max_samples,
-    ):
-        pred_batch = _eval_step(tf.convert_to_tensor(batch_x, dtype=tf.float32))
-        all_truth.append(np.asarray(batch_y, dtype=np.float32).reshape(-1))
-        all_pred.append(np.asarray(pred_batch, dtype=np.float32).reshape(-1))
+
+    use_tfdata = os.environ.get("MICRO_VALIDATION_TFDATA", "0").strip() in {"1", "true", "yes", "on"}
+
+    if use_tfdata:
+        dataset = make_tfdata_eval_dataset(
+            config, data_processor, data_set, truncation_strategy, max_samples,
+        )
+        for batch_x, batch_y in dataset:
+            pred_batch = _eval_step(batch_x)
+            all_truth.append(np.asarray(batch_y, dtype=np.float32).reshape(-1))
+            all_pred.append(np.asarray(pred_batch, dtype=np.float32).reshape(-1))
+    else:
+        for batch_x, batch_y in iter_nonstreaming_eval_batches(
+            config,
+            data_processor,
+            data_set,
+            truncation_strategy=truncation_strategy,
+            max_samples=max_samples,
+        ):
+            pred_batch = _eval_step(tf.convert_to_tensor(batch_x, dtype=tf.float32))
+            all_truth.append(np.asarray(batch_y, dtype=np.float32).reshape(-1))
+            all_pred.append(np.asarray(pred_batch, dtype=np.float32).reshape(-1))
 
     if not all_truth:
         return {"y_true": np.zeros(0, dtype=np.float32), "y_pred": np.zeros(0, dtype=np.float32), **_compute_binary_metrics_from_outputs(np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32))}
