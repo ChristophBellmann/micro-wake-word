@@ -1086,10 +1086,17 @@ def build_tfrecord_training_dataset(config, data_processor):
         s = tf.reshape(parsed["s"], (1,))
         return x, y, w, s
 
-    dataset = tf.data.TFRecordDataset(
-        tfrecord_path, num_parallel_reads=tf.data.AUTOTUNE
-    )
-    dataset = dataset.map(_parse_record, num_parallel_calls=tf.data.AUTOTUNE)
+    parallelism = env_int("MICRO_TRAIN_TFRECORD_PARALLELISM", 0, minimum=0)
+    if parallelism > 0:
+        dataset = tf.data.TFRecordDataset(
+            tfrecord_path, num_parallel_reads=parallelism
+        )
+        dataset = dataset.map(_parse_record, num_parallel_calls=parallelism)
+    else:
+        dataset = tf.data.TFRecordDataset(
+            tfrecord_path, num_parallel_reads=tf.data.AUTOTUNE
+        )
+        dataset = dataset.map(_parse_record, num_parallel_calls=tf.data.AUTOTUNE)
 
     # Optional dataset cache layer before shuffle/repeat to reduce disk IO.
     # Default "auto": cache in RAM when estimated record size fits configured budget.
