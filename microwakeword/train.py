@@ -682,6 +682,12 @@ def run_nonstreaming_numpy_eval(
     max_samples: int = 0,
 ):
     """Run nonstreaming eval in eager NumPy batches, bypassing tf.data generator ops."""
+    jit_compile = os.environ.get("MICRO_TRAIN_JIT_COMPILE", "0").strip() in {"1", "true", "yes", "on"}
+
+    @tf.function(reduce_retracing=True, jit_compile=jit_compile)
+    def _eval_step(x):
+        return model(x, training=False)
+
     all_truth = []
     all_pred = []
     for batch_x, batch_y in iter_nonstreaming_eval_batches(
@@ -691,7 +697,7 @@ def run_nonstreaming_numpy_eval(
         truncation_strategy=truncation_strategy,
         max_samples=max_samples,
     ):
-        pred_batch = model(tf.convert_to_tensor(batch_x, dtype=tf.float32), training=False)
+        pred_batch = _eval_step(tf.convert_to_tensor(batch_x, dtype=tf.float32))
         all_truth.append(np.asarray(batch_y, dtype=np.float32).reshape(-1))
         all_pred.append(np.asarray(pred_batch, dtype=np.float32).reshape(-1))
 
