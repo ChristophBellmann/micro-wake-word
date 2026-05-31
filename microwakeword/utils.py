@@ -385,6 +385,10 @@ def convert_saved_model_to_tflite(
                 yield [sample]
 
     converter = tf.lite.TFLiteConverter.from_saved_model(path_to_model)
+    if converter is None:
+        converter = tf.lite.TFLiteConverter.from_keras_model(
+            tf.keras.models.load_model(path_to_model)
+        )
     converter.optimizations = {tf.lite.Optimize.DEFAULT}
 
     # Without this flag, the Streaming layer `state` variables are left as float32,
