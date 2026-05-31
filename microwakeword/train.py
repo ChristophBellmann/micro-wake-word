@@ -671,6 +671,15 @@ def iter_nonstreaming_eval_batches(
             proc.join(timeout=1.0)
             if proc.is_alive():
                 proc.terminate()
+                proc.join(timeout=5.0)
+        import os as _os
+        while True:
+            try:
+                wpid, _ = _os.waitpid(-1, _os.WNOHANG)
+                if wpid == 0:
+                    break
+            except ChildProcessError:
+                break
         result_q.close()
 
 
