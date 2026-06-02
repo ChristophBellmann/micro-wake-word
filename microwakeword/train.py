@@ -949,6 +949,60 @@ def _float_feature(value: float) -> tf.train.Feature:
     return tf.train.Feature(float_list=tf.train.FloatList(value=[float(value)]))
 
 
+def _tfrecord_provider_signature(providers):
+    signature = []
+    for provider in providers:
+        provider_item = {
+            "class": provider.__class__.__name__,
+            "label": float(getattr(provider, "label", -1.0)),
+            "sampling_weight": float(getattr(provider, "sampling_weight", 0.0)),
+            "penalty_weight": float(getattr(provider, "penalty_weight", 0.0)),
+            "truncation_strategy": str(getattr(provider, "truncation_strategy", "")),
+            "hard_label_threshold": float(getattr(provider, "hard_label_threshold", -1.0)),
+            "fixed_right_cutoffs": list(getattr(provider, "fixed_right_cutoffs", [])),
+            "training_size": int(provider.get_mode_size("training")),
+        }
+        signature.append(provider_item)
+    return signature
+
+
+def _tfrecord_env_signature():
+    keys = [
+        "MICRO_STUDENT_PROFILE",
+        "POS_SAMPLING_WEIGHT",
+        "NEG_SAMPLING_WEIGHT",
+        "AMBIENT_SAMPLING_WEIGHT",
+        "NEGATIVE_CLASS_WEIGHT",
+        "HARD_NEG_SAMPLING_WEIGHT",
+        "HARD_NEG_FEATURE_DIRS",
+        "HARD_POSITIVE_SAMPLING_WEIGHT",
+        "HARD_POSITIVE_PENALTY_WEIGHT",
+        "DISTILLATION_ENABLED",
+        "DISTILLATION_LABELS_DIR",
+        "DISTILLATION_ALPHA",
+        "DISTILLATION_BETA",
+        "DISTILLATION_TEMPERATURE",
+        "DISTILLATION_SAMPLING_WEIGHT",
+        "DISTILLATION_HARD_THRESHOLD",
+        "DISTILLATION_POSITIVE_SCORE_FLOOR",
+        "DISTILLATION_POSITIVE_PATH_PREFIXES",
+        "DISTILLATION_NEGATIVE_SCORE_CEILING",
+        "DISTILLATION_NEGATIVE_PATH_PREFIXES",
+    ]
+    return {key: os.environ.get(key, "") for key in keys}
+
+
+def _load_tfrecord_metadata(metadata_path):
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as meta_in:
+            return json.load(meta_in)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        logging.warning("Ignoring unreadable TFRecord metadata: %s (%s)", metadata_path, exc)
+        return None
+
+
 def build_tfrecord_training_dataset(config, data_processor):
     """Create (or reuse) TFRecord training cache and build tf.data pipeline from it."""
     feature_shape = tuple(config["training_input_shape"])
@@ -1002,14 +1056,42 @@ def build_tfrecord_training_dataset(config, data_processor):
         provider_weights = np.ones(len(providers), dtype=np.float64)
     provider_probs = provider_weights / np.sum(provider_weights)
 
-    if rebuild_cache or (not os.path.isfile(tfrecord_path)):
+    expected_metadata = {
+        "record_count": record_count,
+        "feature_shape": list(feature_shape),
+        "features_length": features_length,
+        "provider_count": len(providers),
+        "build_batch_size": build_batch_size,
+        "provider_signature": _tfrecord_provider_signature(providers),
+        "env_signature": _tfrecord_env_signature(),
+    }
+    existing_metadata = _load_tfrecord_metadata(metadata_path)
+    metadata_matches = existing_metadata == expected_metadata
+    if os.path.isfile(tfrecord_path) and not metadata_matches:
+        if existing_metadata is None:
+            logging.info("Rebuilding TFRecord training cache: metadata missing or invalid")
+        else:
+            logging.info(
+                "Rebuilding TFRecord training cache: metadata mismatch (cached_shape=%s current_shape=%s)",
+                existing_metadata.get("feature_shape"),
+                expected_metadata["feature_shape"],
+            )
+
+    if rebuild_cache or (not os.path.isfile(tfrecord_path)) or (not metadata_matches):
         logging.info(
             "Building TFRecord training cache: %s (examples=%d, build_batch=%d)",
             tfrecord_path,
             record_count,
             build_batch_size,
         )
-        writer = tf.io.TFRecordWriter(tfrecord_path)
+        tmp_tfrecord_path = f"{tfrecord_path}.tmp"
+        tmp_metadata_path = f"{metadata_path}.tmp"
+        for stale_path in (tmp_tfrecord_path, tmp_metadata_path):
+            try:
+                os.remove(stale_path)
+            except FileNotFoundError:
+                pass
+        writer = tf.io.TFRecordWriter(tmp_tfrecord_path)
         try:
             written = 0
             while written < record_count:
@@ -1057,18 +1139,10 @@ def build_tfrecord_training_dataset(config, data_processor):
         finally:
             writer.close()
 
-        with open(metadata_path, "w", encoding="utf-8") as meta_out:
-            json.dump(
-                {
-                    "record_count": record_count,
-                    "feature_shape": list(feature_shape),
-                    "features_length": features_length,
-                    "provider_count": len(providers),
-                    "build_batch_size": build_batch_size,
-                },
-                meta_out,
-                indent=2,
-            )
+        with open(tmp_metadata_path, "w", encoding="utf-8") as meta_out:
+            json.dump(expected_metadata, meta_out, indent=2, sort_keys=True)
+        os.replace(tmp_tfrecord_path, tfrecord_path)
+        os.replace(tmp_metadata_path, metadata_path)
     else:
         _log_info_once(
             f"tfrecord-cache-reuse:{tfrecord_path}",
