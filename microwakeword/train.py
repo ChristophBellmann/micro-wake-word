@@ -21,6 +21,9 @@ import contextlib
 from absl import logging
 
 import numpy as np
+
+# NumPy 2 renamed trapz to trapezoid; keep NumPy 1.26 (e.g. ROCm TensorFlow builds) working.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import tensorflow as tf
 
 from tensorflow.python.util import tf_decorator
@@ -151,7 +154,7 @@ def validate_nonstreaming(config, data_processor, model, test_set):
 
         # Use trapezoid rule to estimate the area under the curve, then divide by 2.0 to get the average recall
         average_viable_recall = (
-            np.trapezoid(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
+            _trapezoid(np.flip(y_coordinates), np.flip(x_coordinates)) / 2.0
         )
 
         metrics["recall_at_no_faph"] = recall_at_no_faph

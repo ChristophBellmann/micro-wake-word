@@ -19,6 +19,9 @@
 import os
 
 import numpy as np
+
+# NumPy 2 renamed trapz to trapezoid; keep NumPy 1.26 (e.g. ROCm TensorFlow builds) working.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 import tensorflow as tf
 
 from absl import logging
@@ -388,7 +391,7 @@ def tflite_streaming_model_roc(
 
     path = os.path.join(config["train_dir"], folder)
     with open(os.path.join(path, accuracy_name), "wt") as fd:
-        auc = np.trapezoid(y_coordinates, x_coordinates)
+        auc = _trapezoid(y_coordinates, x_coordinates)
         auc_string = "AUC {:.5f}".format(auc)
         logging.info(auc_string)
         fd.write(auc_string + "\n")

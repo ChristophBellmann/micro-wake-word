@@ -15,6 +15,7 @@
 # limitations under the License.
 
 """Utility functions for operations on Model."""
+import contextlib
 import os.path
 import numpy as np
 import tensorflow as tf
@@ -22,6 +23,32 @@ import tensorflow as tf
 from absl import logging
 
 from microwakeword.layers import modes, stream, strided_drop
+
+
+@contextlib.contextmanager
+def _workaround_dictwrapper_tf_type_bug():
+    """Avoid a TF 2.20/Python 3.12 SavedModel export crash on _DictWrapper."""
+    try:
+        from tensorflow.python.framework import tensor_util  # pylint: disable=g-direct-tensorflow-import
+    except Exception:
+        yield
+        return
+
+    original_is_tf_type = tensor_util.is_tf_type
+
+    def safe_is_tf_type(obj):
+        try:
+            return original_is_tf_type(obj)
+        except TypeError as exc:
+            if "_DictWrapper" in str(exc):
+                return False
+            raise
+
+    tensor_util.is_tf_type = safe_is_tf_type
+    try:
+        yield
+    finally:
+        tensor_util.is_tf_type = original_is_tf_type
 
 
 def _set_mode(model, mode):
@@ -325,6 +352,11 @@ def convert_saved_model_to_tflite(
                 yield [sample]
 
     converter = tf.lite.TFLiteConverter.from_saved_model(path_to_model)
+    if converter is None:
+        # Some ROCm TensorFlow builds return None here.
+        converter = tf.lite.TFLiteConverter.from_keras_model(
+            tf.keras.models.load_model(path_to_model)
+        )
     converter.optimizations = {tf.lite.Optimize.DEFAULT}
 
     # Without this flag, the Streaming layer `state` variables are left as float32,
@@ -377,7 +409,8 @@ def convert_model_saved(model, config, folder, mode):
         fn=converted_model.call,
         input_signature=[tf.TensorSpec(shape=converted_model.input.shape, dtype=tf.float32)],
     )
-    export_archive.write_out(path_model)
+    with _workaround_dictwrapper_tf_type_bug():
+        export_archive.write_out(path_model)
 
     save_model_summary(converted_model, path_model)
 

@@ -11,7 +11,7 @@ setuptools.setup(
         "audio_metadata",
         "datasets",
         "mmap_ninja",
-        "numpy>=2.0",
+        "numpy>=1.26",
         "pymicro-features",
         "pyyaml",
         "tensorflow>=2.18",
